@@ -1,0 +1,17 @@
+[project]
+name = "local-rufus"
+version = "0.1.0"
+description = "Local Rufus — conversational shopping AI (Amazon Rufus clone)"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=4.8.5",
+    "huggingface-hub>=1.17.0",
+    "ollama>=0.6.2",
+    "qdrant-client>=1.18.0",
+    "requests>=2.34.2",
+    "rich>=15.0.0",
+    "sentence-transformers>=5.5.1",
+    "torch>=2.12.0",
+    "tqdm>=4.67.3",
+    "typer>=0.25.1",
+]
