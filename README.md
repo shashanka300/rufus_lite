@@ -77,13 +77,55 @@ uv run python scripts/query.py --q "best noise-cancelling headphones under $200"
 uv run python scripts/query.py --top-k 8 --model qwen3.5:27b
 ```
 
+### Step 4 — CLIP ingestion (Week 3, run after ESCI ingest)
+
+```bash
+uv run python scripts/ingest_clip.py   # ~164 900 products, minutes not hours
+```
+
+### Step 5 — evaluate retrieval quality (Week 4)
+
+```bash
+# Compare BGE-M3 vs BGE-M3+CLIP fusion on ESCI test set
+uv run python scripts/eval_ndcg.py
+
+# More queries for tighter confidence intervals
+uv run python scripts/eval_ndcg.py --n-queries 1000 --k 10
+```
+
+### Step 6 — Streamlit UI
+
+```bash
+uv run streamlit run app.py
+```
+
+Opens at `http://localhost:8501`. Sidebar lets you pick model, adjust top-K, and start a new session.
+
+### Step 7 — multi-turn conversation (CLI, Week 2)
+
+```bash
+# Interactive multi-turn chat (LangGraph session state + intent routing)
+uv run python scripts/chat.py
+
+# Use a larger model
+uv run python scripts/chat.py --model qwen3.5:27b
+
+# Resume a named session
+uv run python scripts/chat.py --session my-session
+```
+
+The chat CLI classifies each message (search / followup / qa / compare / chitchat),
+routes it through a LangGraph graph, and maintains product context across turns so
+follow-up questions like "do any come in red?" work without re-searching.
+
 ## Models
 
 | Role | Default | Notes |
 |---|---|---|
 | LLM | `qwen3.5:latest` | Conversation + Q&A |
 | Embedding | `BAAI/bge-m3` | Dense 1024-dim, loaded from HF |
-| Reranker | — | Week 3+ |
+| Intent router | `qwen3.5:latest` | Classifies search / followup / qa / compare / chitchat |
+| CLIP | `openai/clip-vit-large-patch14` | 768-dim image-text embeddings for visual search |
 
 Recommended Ollama pulls for the full stack:
 ```bash
@@ -104,6 +146,6 @@ ollama pull lfm2.5-thinking  # 1.2B intent router (<50 ms)
 ## Build roadmap
 
 - **Week 1 (done):** Catalog RAG — ESCI → BGE-M3 → Qdrant → Qwen3 Q&A
-- **Week 2:** Conversational layer — LangGraph session state, intent classification, MG-ShopDial few-shot
-- **Week 3:** Multimodal — SQID + CLIP, dual-encoder retrieval, fuse with BGE-M3 text scores
-- **Week 4:** Evaluation — ESCI NDCG benchmark + eval harness
+- **Week 2 (done):** Conversational layer — LangGraph session state, intent classification (search/followup/qa/compare/chitchat), MG-ShopDial-informed few-shot prompts
+- **Week 3 (done):** Multimodal — SQID CLIP image vectors (ViT-L/14, 768-dim) in separate `rufus_clip` collection; dual-encoder retrieval (BGE-M3 text + CLIP image); RRF score fusion
+- **Week 4 (done):** Evaluation — ESCI NDCG@K benchmark; BGE-M3 vs BGE-M3+CLIP RRF comparison; score distribution breakdown

@@ -11,6 +11,7 @@ Usage:
   uv run python scripts/ingest_esci.py --reset    # drop + rebuild collection
 """
 
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -61,14 +62,29 @@ def build_product_text(row: pd.Series) -> str:
         bullets = str(row["product_bullet_point"])[:MAX_BULLETS_CHARS]
         parts.append(bullets)
 
+    if pd.notna(row["product_description"]) and row["product_description"]:
+        desc = str(row["product_description"])[:400]
+        parts.append(desc)
+
     return " | ".join(parts)
 
 
 # ── Qdrant helpers ─────────────────────────────────────────────────────────
 
 def get_client() -> QdrantClient:
-    QDRANT_PATH.mkdir(parents=True, exist_ok=True)
-    return QdrantClient(path=str(QDRANT_PATH))
+    # Prefer Qdrant gRPC server — faster for bulk ingest, no HTTP payload limits
+    try:
+        c = QdrantClient(
+            host="localhost", port=6333, grpc_port=6334,
+            prefer_grpc=True, timeout=300,
+        )
+        c.get_collections()
+        console.print("  [green]Using Qdrant server (gRPC) at localhost:6334[/green]")
+        return c
+    except Exception:
+        console.print("  [yellow]Qdrant server not found — using local file mode (high RAM)[/yellow]")
+        QDRANT_PATH.mkdir(parents=True, exist_ok=True)
+        return QdrantClient(path=str(QDRANT_PATH))
 
 
 def ensure_collection(client: QdrantClient, reset: bool = False) -> None:
@@ -211,7 +227,7 @@ def ingest(
             for j, (_, row) in enumerate(batch_rows.iterrows()):
                 points.append(
                     PointStruct(
-                        id=abs(hash(row["product_id"])) % (2**63),
+                        id=int(hashlib.sha256(row["product_id"].encode()).hexdigest()[:16], 16),
                         vector=embeddings[j].tolist(),
                         payload={
                             "product_id": row["product_id"],

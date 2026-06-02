@@ -1,6 +1,6 @@
 """
 Product retriever: BGE-M3 dense embedding + Qdrant nearest-neighbour search.
-Model is lazy-loaded on first call so import is cheap.
+Model and Qdrant client are both lazy-loaded on first use.
 """
 
 from __future__ import annotations
@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
 EMBED_MODEL = "BAAI/bge-m3"
@@ -27,19 +26,18 @@ class Product:
     description: str | None
     locale: str
     score: float
+    image_url: str | None = None
 
 
 class ProductRetriever:
     def __init__(
         self,
-        qdrant_path: Path = QDRANT_PATH,
         collection: str = COLLECTION,
         model_name: str = EMBED_MODEL,
     ) -> None:
         self.collection = collection
         self.model_name = model_name
         self._model: SentenceTransformer | None = None
-        self._client = QdrantClient(path=str(qdrant_path))
 
         if torch.cuda.is_available():
             self._device = "cuda"
@@ -54,8 +52,22 @@ class ProductRetriever:
             self._model = SentenceTransformer(self.model_name, device=self._device)
         return self._model
 
-    def retrieve(self, query: str, top_k: int = 5) -> list[Product]:
+    @property
+    def _client(self):
+        from rufus.qdrant import get_client
+        return get_client()
+
+    def _embed(self, query: str) -> list[float]:
+        from rufus.cache import embedding_cache
+        cached = embedding_cache.fetch((query,))
+        if cached is not None:
+            return cached
         vec = self.model.encode(query, normalize_embeddings=True).tolist()
+        embedding_cache.put((query,), vec)
+        return vec
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[Product]:
+        vec = self._embed(query)
         hits = self._client.query_points(
             collection_name=self.collection,
             query=vec,
