@@ -135,14 +135,19 @@ def _retrieve(query: str, intent: str, top_k: int = 5, image_data: str | None = 
         candidates = text_hits
 
     reranked = _get_reranker().rerank(query, candidates, top_k=top_k * 2)
-    return [p for p in reranked if p.image_url][:top_k]
+    return reranked[:top_k]
 
 
 def _products_to_json(products: list) -> list[dict]:
+    from rufus.images import get_image_urls_batch
     from rufus.reviews import get_meta_batch
-    ids     = [p.product_id for p in products]
+    ids      = [p.product_id for p in products]
     meta_map = get_meta_batch(ids)
-    result  = []
+    # Fill image URLs: prefer what's already on the Product (CLIP collection),
+    # fall back to the image lookup DB for BGE-M3-only results.
+    missing  = [p.product_id for p in products if not p.image_url]
+    img_map  = get_image_urls_batch(missing) if missing else {}
+    result   = []
     for p in products:
         meta = meta_map.get(p.product_id) or {}
         result.append({
@@ -152,7 +157,7 @@ def _products_to_json(products: list) -> list[dict]:
             "color":        p.color,
             "bullet_point": p.bullet_point,
             "score":        round(p.score, 4),
-            "image_url":    p.image_url,
+            "image_url":    p.image_url or img_map.get(p.product_id),
             "price":        meta.get("price"),
             "avg_rating":   meta.get("avg_rating"),
             "rating_count": meta.get("rating_count"),
