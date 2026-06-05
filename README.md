@@ -1,151 +1,305 @@
-# Local Rufus
+# Rufus Lite
 
-A local clone of Amazon Rufus — a conversational AI shopping assistant — running entirely on your own hardware via Ollama.
+A local clone of Amazon Rufus — a conversational AI shopping assistant extended with supply chain and inventory management — running entirely on your own hardware via Ollama. No cloud API required.
 
 ## What it does
 
-- Embeds Amazon ESCI product catalog with BGE-M3 into a local Qdrant vector store
-- Answers natural-language shopping questions by retrieving relevant products and grounding an LLM response in them (RAG)
-- Interactive REPL or single-query CLI
+**Shopping assistant**
+- Natural-language product search across 1.2 M ESCI products
+- Multi-turn conversation with intent routing (12 intents)
+- Dual-encoder retrieval: BGE-M3 text + CLIP image vectors fused with RRF
+- Cross-encoder reranking (bge-reranker-v2-m3)
+- Personalization — user preference tracking biases reranking per session
+- Cart management persisted across conversation turns
+- Gift / occasion search mode
+- Seller Q&A templates by category
+- Product metadata enrichment: price, star rating, features (5.5 M ASINs across 33 Amazon categories)
+- Streaming responses via AG-UI SSE protocol
 
-## Hardware target
+**Supply chain layer** *(beyond Amazon Rufus)*
+- Inventory tracking — 32 K SKUs, stock levels, reorder points
+- Reorder alerts with urgency scoring (critical / soon / ok)
+- Demand forecasting — 30-day ahead, rolling average + optional AutoETS
+- Supplier catalog with lead times (Olist sellers + SCMS vendor data)
+- 15 K pre-computed forecasts for top SKUs
 
-RTX 5090 (32 GB VRAM). All models fit locally; no cloud API required.
+## Hardware
+
+| Component | Spec |
+|---|---|
+| GPU | NVIDIA RTX 5090, 34 GB VRAM |
+| CUDA | 13.x (cu128 wheels) |
+| PyTorch | 2.11.0+cu128 |
+| Python | 3.11 |
+| Package manager | uv |
+
+All inference is fp16 on CUDA. VRAM usage with all models loaded: ~3.2 GB (31 GB free for LLM).
+
+## Architecture
+
+```
+User query
+    │
+    ▼
+classify  (qwen3:1.7b, <2ms fast-path rules, LLM fallback)
+    │
+    ├─ search / qa / compare / gift_search
+    │       │
+    │       ├─ retrieve  (BGE-M3 + CLIP → RRF → cross-encoder rerank)
+    │       │           └─ personalization bias
+    │       └─ generate  (qwen3:1.7b, seller Q&A template or LLM)
+    │
+    ├─ followup          → generate (reuse products from state)
+    ├─ add_to_cart        → cart node
+    ├─ view_cart          → cart node
+    ├─ chitchat           → chitchat node
+    │
+    └─ supply chain intents
+            │
+            ├─ check_stock        → inventory_lookup
+            ├─ reorder_alert      → bulk_reorder_check
+            ├─ demand_forecast    → forecast_sku
+            ├─ supplier_query     → supplier lookup
+            └─ sc_analytics       → category_demand_summary
+                    └─ sc_generate (qwen3:1.7b)
+```
 
 ## Project layout
 
 ```
-rufus/          core library
-  retriever.py  BGE-M3 embedding + Qdrant nearest-neighbour search
-  rag.py        retrieval → prompt → Ollama answer pipeline
-  llm.py        thin Ollama chat wrapper (streaming + non-streaming)
+rufus/
+  hardware.py       TF32 + cuDNN benchmark flags — imported globally
+  retriever.py      BGE-M3 fp16 embedding + Qdrant nearest-neighbour
+  clip_retriever.py CLIP ViT-L/14 fp16 text/image encoding
+  fusion.py         Reciprocal Rank Fusion (RRF, k=60)
+  reranker.py       bge-reranker-v2-m3 fp16 cross-encoder, batch=128
+  intent.py         12-intent classifier (fast-path rules + qwen3:1.7b LLM)
+  graph.py          LangGraph StateGraph with MemorySaver
+  state.py          ShoppingState TypedDict (messages, products, cart, sc_items …)
+  llm.py            Ollama client — circuit breaker, retry, keep_alive, think=False
+  rag.py            RAG context formatter + SYSTEM_PROMPT
+  reviews.py        Amazon Reviews 2023 metadata lookup (rufus_reviews.db)
+  cache.py          LRU+TTL caches for embeddings and rerank results
+  telemetry.py      RED-method structured logging
+  personalization.py User preference profiles (SQLite) + rerank bias
+  cart.py           Session cart (add / remove / view / total)
+  seller_qa.py      Category Q&A templates (electronics/headphones/clothing/…)
+  inventory.py      Supply chain SQLite schema + query helpers
+  demand.py         Demand forecasting — ForecastResult, ReorderAlert
+  sc_rag.py         Supply chain LLM context formatter
+
+server.py           FastAPI AG-UI SSE backend (main entry point)
+app.py              Legacy Streamlit UI (week 2)
+frontend/
+  index.html        Single-file Tailwind streaming chat UI
+
 scripts/
-  download_datasets.py   download ESCI, SQID, Amazon Reviews, MG-ShopDial
-  ingest_esci.py         embed ESCI products → upsert into Qdrant
-  query.py               interactive query CLI
-data/           local data and Qdrant storage (git-ignored)
+  download_datasets.py        Week 1 datasets (ESCI, SQID, Amazon Reviews, MGShopDial)
+  download_all_data.py        Full-scale download (all sources: HF, Kaggle, GitHub, HTTP)
+  ingest_esci.py              ESCI products → Qdrant rufus_products collection
+  ingest_clip.py              SQID CLIP vectors → Qdrant rufus_clip collection
+  ingest_olist.py             Olist → rufus_sc.db (inventory, demand, suppliers)
+  ingest_scms.py              SCMS → rufus_sc.db suppliers (lead times)
+  ingest_amazon_reviews_full.py  All-category metadata → rufus_reviews.db
+  train_demand_forecast.py    M5 + Olist → forecasts table in rufus_sc.db
+  eval_ndcg.py                NDCG@K evaluation on ESCI test set
+  chat.py                     Multi-turn CLI (legacy)
+  query.py                    Single-query CLI (legacy)
+  start_qdrant.ps1            Start Qdrant standalone binary
+
+data/                         Git-ignored — datasets + DB files
+  esci/                       ESCI shopping queries dataset
+  sqid/                       CLIP image vectors (pre-computed)
+  amazon_reviews/             Electronics metadata (week 1)
+  amazon_reviews_full/        All-category metadata (33 categories, 5.5 M ASINs)
+  amazon_c4/                  Product Q&A pairs
+  supply_chain/
+    olist/                    Brazilian e-commerce orders/sellers (~100 K orders)
+    m5/                       Walmart daily sales (30 K SKUs, 5 years)
+    dataco/                   Supply chain event records
+    scms/                     SCMS supplier delivery history
+    uci_retail/               UK e-commerce transactions
+    rossmann/                 M4 daily retail sales
+  personalization/
+    retailrocket/             Session events (view/cart/purchase)
+    instacart/                Grocery basket analysis
+  dialogue/
+    simmc2/                   Multimodal shopping dialogues
+    durecdial/                Goal-driven recommendation dialogues
+    redial/                   Conversational movie recommendation
+  mgshop_dial/                Multi-goal shopping dialogues
+  qdrant_storage/             Qdrant data (rufus_products + rufus_clip)
+  rufus_sc.db                 Supply chain SQLite (inventory, demand, forecasts, suppliers)
+  rufus_reviews.db            Amazon Reviews metadata (5.5 M rows, price + ratings)
 ```
 
 ## Setup
 
 ```bash
-# 1. Install uv if you don't have it
-curl -Ls https://astral.sh/uv/install.sh | sh
+# 1. Install uv
+curl -Ls https://astral.sh/uv/install.sh | sh   # Linux/Mac
+# or: powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
-# 2. Create venv and install deps
+# 2. Install dependencies (PyTorch cu128 pulled automatically)
 uv sync
 
-# 3. Pull the LLM via Ollama
-ollama pull qwen3.5:latest
+# 3. Pull the LLM
+ollama pull qwen3:1.7b
 ```
 
 ## Quickstart
 
-### Step 1 — download data
+### 1 — Download data
 
 ```bash
-# ESCI only (needed for Week 1 RAG)
-uv run python scripts/download_datasets.py esci
-
-# All datasets
+# Week 1 essentials (ESCI, SQID, Amazon Reviews Electronics, MGShopDial)
 uv run python scripts/download_datasets.py all
+
+# Full-scale download — all datasets across all groups
+uv run python scripts/download_all_data.py all
+
+# Individual groups
+uv run python scripts/download_all_data.py catalog       # Amazon Reviews all categories
+uv run python scripts/download_all_data.py supply        # Olist, M5, DataCo, SCMS, UCI
+uv run python scripts/download_all_data.py personalization  # RetailRocket, Instacart
+uv run python scripts/download_all_data.py dialogue      # SIMMC2, DuRecDial, ReDial
+
+# Check what's downloaded
+uv run python scripts/download_all_data.py status
 ```
 
-### Step 2 — ingest products into Qdrant
+### 2 — Ingest into Qdrant
 
 ```bash
-# Full English ESCI catalog (~1.3M products, takes ~20 min on GPU)
+# Start Qdrant first (must be running before ingest or app)
+.\scripts\start_qdrant.ps1          # Windows PowerShell
+# or: docker compose up -d qdrant   # if Docker available
+
+# Full ESCI catalog (~1.2 M products, ~20 min on GPU)
 uv run python scripts/ingest_esci.py
 
-# Quick smoke-test with 5 000 products
+# Quick smoke-test
 uv run python scripts/ingest_esci.py --limit 5000
 
-# Rebuild from scratch
-uv run python scripts/ingest_esci.py --reset
+# CLIP image vectors (optional, ~3 min)
+uv run python scripts/ingest_clip.py
 ```
 
-### Step 3 — query Rufus
+### 3 — Ingest supply chain + reviews
 
 ```bash
-# Interactive REPL
-uv run python scripts/query.py
+# Olist → inventory, demand history, suppliers (rufus_sc.db)
+uv run python scripts/ingest_olist.py
 
-# Single question
-uv run python scripts/query.py --q "best noise-cancelling headphones under $200"
+# SCMS → supplier lead times (appends to rufus_sc.db)
+uv run python scripts/ingest_scms.py
 
-# More retrieved products, different model
-uv run python scripts/query.py --top-k 8 --model qwen3.5:27b
+# Amazon Reviews all categories → price, ratings, features (rufus_reviews.db)
+uv run python scripts/ingest_amazon_reviews_full.py
+
+# Train demand forecasts (M5 + Olist → forecasts table)
+uv run python scripts/train_demand_forecast.py
 ```
 
-### Step 4 — CLIP ingestion (Week 3, run after ESCI ingest)
+### 4 — Start the server
 
 ```bash
-uv run python scripts/ingest_clip.py   # ~164 900 products, minutes not hours
+# Terminal 1 — Qdrant (keep running)
+.\scripts\start_qdrant.ps1
+
+# Terminal 2 — FastAPI AG-UI server
+uv run uvicorn server:app --reload
 ```
 
-### Step 5 — evaluate retrieval quality (Week 4)
+Open **http://localhost:8000** — the chat UI loads automatically.
+
+### 5 — Evaluate retrieval quality
 
 ```bash
-# Compare BGE-M3 vs BGE-M3+CLIP fusion on ESCI test set
-uv run python scripts/eval_ndcg.py
-
-# More queries for tighter confidence intervals
-uv run python scripts/eval_ndcg.py --n-queries 1000 --k 10
+uv run python scripts/eval_ndcg.py                    # 300 queries, NDCG@10
+uv run python scripts/eval_ndcg.py --n-queries 1000   # tighter confidence intervals
+uv run python scripts/eval_ndcg.py --k 5              # NDCG@5
 ```
 
-### Step 6 — Streamlit UI
+## Intent guide
 
-```bash
-uv run streamlit run app.py
-```
-
-Opens at `http://localhost:8501`. Sidebar lets you pick model, adjust top-K, and start a new session.
-
-### Step 7 — multi-turn conversation (CLI, Week 2)
-
-```bash
-# Interactive multi-turn chat (LangGraph session state + intent routing)
-uv run python scripts/chat.py
-
-# Use a larger model
-uv run python scripts/chat.py --model qwen3.5:27b
-
-# Resume a named session
-uv run python scripts/chat.py --session my-session
-```
-
-The chat CLI classifies each message (search / followup / qa / compare / chitchat),
-routes it through a LangGraph graph, and maintains product context across turns so
-follow-up questions like "do any come in red?" work without re-searching.
+| Intent | Trigger examples | Pipeline |
+|---|---|---|
+| `search` | "show me wireless headphones" | retrieve → generate |
+| `followup` | "does it come in black?", "the second one" | reuse products → generate |
+| `qa` | "what's the battery life?" | seller Q&A template or retrieve → generate |
+| `compare` | "compare the first two", "which is better" | retrieve → generate |
+| `gift_search` | "gift for my dad", "present for my wife" | retrieve → generate (gift framing) |
+| `add_to_cart` | "add to cart", "I'll take it" | cart node |
+| `view_cart` | "show my cart", "cart total" | cart node |
+| `chitchat` | "hello", "thanks" | chitchat node |
+| `check_stock` | "is the Anker charger in stock?" | inventory lookup → sc_generate |
+| `reorder_alert` | "what needs to be reordered?" | bulk_reorder_check → sc_generate |
+| `demand_forecast` | "forecast demand for electronics" | forecast_sku → sc_generate |
+| `supplier_query` | "who are our suppliers?" | supplier lookup → sc_generate |
 
 ## Models
 
-| Role | Default | Notes |
+| Role | Model | Notes |
 |---|---|---|
-| LLM | `qwen3.5:latest` | Conversation + Q&A |
-| Embedding | `BAAI/bge-m3` | Dense 1024-dim, loaded from HF |
-| Intent router | `qwen3.5:latest` | Classifies search / followup / qa / compare / chitchat |
-| CLIP | `openai/clip-vit-large-patch14` | 768-dim image-text embeddings for visual search |
+| LLM | `qwen3:1.7b` | Generation + intent (when LLM path taken). think=False kwarg, temperature=0, keep_alive=60m |
+| Embedding | `BAAI/bge-m3` | 1024-dim fp16, 1.8 ms/query on RTX 5090 |
+| CLIP | `openai/clip-vit-large-patch14` | 768-dim fp16, 3.8 ms/encode |
+| Reranker | `BAAI/bge-reranker-v2-m3` | fp16, batch=128, 30 ms for 40 candidates |
 
-Recommended Ollama pulls for the full stack:
-```bash
-ollama pull qwen3.5:27b      # main reasoning model
-ollama pull glm-5.1          # best tool calling / JSON output
-ollama pull lfm2.5-thinking  # 1.2B intent router (<50 ms)
-```
+**Important:** `think=False` must be passed as a **direct kwarg** to `ollama.chat()`, not inside the `options` dict. Passing it inside `options` routes all output to the `thinking` field and leaves `content` empty.
 
 ## Datasets
 
-| Dataset | Purpose | Size |
-|---|---|---|
-| Amazon ESCI | Product catalog + search relevance labels | ~2.6 M query-item pairs |
-| SQID | ESCI + images + CLIP embeddings | several GB |
-| Amazon Reviews 2023 | Customer reviews for RAG Q&A grounding | metadata ~1–2 GB, full reviews ~22 GB |
-| MG-ShopDial | Multi-goal shopping dialogues for fine-tuning | small |
+| Dataset | Location | Rows / Size | Used for |
+|---|---|---|---|
+| Amazon ESCI | `data/esci/` | 1.2 M products | Catalog, retrieval, eval |
+| SQID CLIP vectors | `data/sqid/` | 164 K products | Image search |
+| Amazon Reviews (Electronics) | `data/amazon_reviews/` | 1.6 M products | RAG enrichment (week 1) |
+| Amazon Reviews (all 33 categories) | `data/amazon_reviews_full/` | 5.5 M ASINs | Price, ratings, features |
+| Amazon-C4 Q&A | `data/amazon_c4/` | 1 M+ pairs | Q&A grounding |
+| MGShopDial | `data/mgshop_dial/` | 64 dialogues | Intent few-shots |
+| Olist E-Commerce | `data/supply_chain/olist/` | 100 K orders | Inventory, demand, suppliers |
+| M5 Forecasting | `data/supply_chain/m5/` | 30 K SKUs × 1 969 days | Demand history |
+| DataCo Supply Chain | `data/supply_chain/dataco/` | 180 K records | Supply chain events |
+| SCMS Delivery History | `data/supply_chain/scms/` | 10 K shipments | Supplier lead times |
+| UCI Online Retail II | `data/supply_chain/uci_retail/` | 1 M transactions | Demand patterns |
+| RetailRocket | `data/personalization/retailrocket/` | 4.7 M events | Session modelling |
+| Instacart | `data/personalization/instacart/` | 3.4 M orders | Basket analysis |
+| SIMMC 2.1 | `data/dialogue/simmc2/` | 11 K dialogues | Intent training |
+| DuRecDial 2.0 | `data/dialogue/durecdial/` | 16 K dialogues | Goal-driven rec |
+| ReDial | `data/dialogue/redial/` | 10 K dialogues | Conversational rec |
+
+## Hardware optimization notes
+
+All models run fp16 on CUDA. Applied via `rufus/hardware.py` at import time:
+
+```python
+torch.set_float32_matmul_precision("high")  # TF32 tensor cores
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True        # auto-selects fastest kernels
+```
+
+Verified timings on RTX 5090:
+- BGE-M3 embed: **1.8 ms**
+- CLIP encode: **3.8 ms**
+- Rerank 40 items: **30 ms** (fp16, batch=128)
+- LLM TTFT (warm, pinned in VRAM): **~300 ms**
+- Full query pipeline: **~1.5 s** (LLM dominates)
 
 ## Build roadmap
 
-- **Week 1 (done):** Catalog RAG — ESCI → BGE-M3 → Qdrant → Qwen3 Q&A
-- **Week 2 (done):** Conversational layer — LangGraph session state, intent classification (search/followup/qa/compare/chitchat), MG-ShopDial-informed few-shot prompts
-- **Week 3 (done):** Multimodal — SQID CLIP image vectors (ViT-L/14, 768-dim) in separate `rufus_clip` collection; dual-encoder retrieval (BGE-M3 text + CLIP image); RRF score fusion
-- **Week 4 (done):** Evaluation — ESCI NDCG@K benchmark; BGE-M3 vs BGE-M3+CLIP RRF comparison; score distribution breakdown
+- **Week 1 ✅** Catalog RAG — ESCI → BGE-M3 → Qdrant → Qwen3 Q&A
+- **Week 2 ✅** Conversational layer — LangGraph, 5-intent classifier, MG-ShopDial few-shots
+- **Week 3 ✅** Multimodal retrieval — SQID CLIP vectors, dual-encoder, RRF fusion
+- **Week 4 ✅** Evaluation — ESCI NDCG@K benchmark, BGE-M3 vs fusion comparison
+- **Week 5 ✅** Production reliability — circuit breaker, retry, caching, telemetry, cross-encoder reranker
+- **Week 6 ✅** AG-UI server + streaming frontend, supply chain layer, mock features, hardware optimisation
+
+**Remaining / in progress:**
+- Review summarization — `rufus_reviews.db` populated, need to wire into RAG context
+- Image search — CLIP collection ready, need to extract base64 from AG-UI message
+- Demand forecast model training at scale (statsforecast AutoETS on full M5)
+- Personalization from real clickstream (RetailRocket + Instacart ingestion)
+- Price display — in metadata, need to surface in product cards UI

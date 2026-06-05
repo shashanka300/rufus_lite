@@ -48,7 +48,7 @@ class ProductReranker:
                 self.model_name,
                 device=self._device,
                 max_length=512,
-                automodel_args={"torch_dtype": torch.float16},  # fp16 on RTX 5090
+                model_kwargs={"torch_dtype": torch.float16},  # fp16 on RTX 5090
             )
         return self._model
 
