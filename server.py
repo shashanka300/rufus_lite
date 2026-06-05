@@ -115,55 +115,86 @@ def _get_reranker():
     return _reranker_instance
 
 
-def _retrieve(query: str, intent: str, top_k: int = 5) -> list:
+def _retrieve(query: str, intent: str, top_k: int = 5, image_data: str | None = None) -> list:
     from rufus.fusion import rrf_fuse
     pool = max(top_k * 8, 40)
     text_hits = _get_retriever().retrieve(query, top_k=pool)
     clip = _get_clip()
-    if intent in ("search", "qa", "compare") and clip.available():
+
+    if image_data and clip.available():
+        import base64, io
+        from PIL import Image as _Image
+        _, b64 = image_data.split(",", 1)
+        pil_img = _Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        clip_hits = clip.retrieve_by_image(pil_img, top_k=pool)
+        candidates = rrf_fuse([text_hits, clip_hits], top_k=pool)
+    elif intent in ("search", "qa", "compare") and clip.available():
         clip_hits = clip.retrieve(query, top_k=pool)
         candidates = rrf_fuse([text_hits, clip_hits], top_k=pool)
     else:
         candidates = text_hits
+
     reranked = _get_reranker().rerank(query, candidates, top_k=top_k * 2)
     return [p for p in reranked if p.image_url][:top_k]
 
 
 def _products_to_json(products: list) -> list[dict]:
-    return [
-        {
-            "product_id":  p.product_id,
-            "title":       p.title,
-            "brand":       p.brand,
-            "color":       p.color,
+    from rufus.reviews import get_meta_batch
+    ids     = [p.product_id for p in products]
+    meta_map = get_meta_batch(ids)
+    result  = []
+    for p in products:
+        meta = meta_map.get(p.product_id) or {}
+        result.append({
+            "product_id":   p.product_id,
+            "title":        p.title,
+            "brand":        p.brand,
+            "color":        p.color,
             "bullet_point": p.bullet_point,
-            "score":       round(p.score, 4),
-            "image_url":   p.image_url,
-        }
-        for p in products
-    ]
+            "score":        round(p.score, 4),
+            "image_url":    p.image_url,
+            "price":        meta.get("price"),
+            "avg_rating":   meta.get("avg_rating"),
+            "rating_count": meta.get("rating_count"),
+        })
+    return result
 
 
-def _extract_text(messages: list) -> tuple[str, list[dict]]:
-    """Return (last_user_text, llm_history) from AG-UI message list."""
+def _extract_message(messages: list) -> tuple[str, list[dict], str | None]:
+    """Return (last_user_text, llm_history, image_data_url) from AG-UI messages.
+
+    image_data_url is the last base64 data: URL found in the most recent user
+    message, or None if no image was attached.
+    """
     history: list[dict] = []
     text = ""
+    image_data_url: str | None = None
     for m in messages:
         role = getattr(m, "role", None) or m.get("role", "user")
         content = getattr(m, "content", None) or m.get("content", "")
         if isinstance(content, list):
-            # multipart — grab text parts
-            text_parts = []
+            text_parts: list[str] = []
+            msg_img: str | None = None
             for part in content:
                 if hasattr(part, "text"):
                     text_parts.append(part.text)
                 elif isinstance(part, dict) and part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
+                elif isinstance(part, dict) and part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    if url.startswith("data:image"):
+                        msg_img = url
+                elif hasattr(part, "image_url"):
+                    url = getattr(getattr(part, "image_url", None), "url", "") or ""
+                    if url.startswith("data:image"):
+                        msg_img = url
             content = " ".join(text_parts)
+            if role == "user" and msg_img:
+                image_data_url = msg_img
         if role == "user":
             text = str(content)
         history.append({"role": role, "content": str(content)})
-    return text, history[:-1]   # last item is the current user turn
+    return text, history[:-1], image_data_url
 
 
 def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
@@ -182,7 +213,7 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
     try:
         emit(RunStartedEvent(thread_id=thread_id, run_id=run_id))
 
-        text, history = _extract_text(input_data.messages or [])
+        text, history, image_data = _extract_message(input_data.messages or [])
         if not text:
             emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
             return
@@ -190,11 +221,18 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
         # ── Classify ───────────────────────────────────────────────────────
         emit(StepStartedEvent(step_name="classify"))
         from rufus.intent import classify
-        clf     = classify(text, history)
-        intent  = clf["intent"]
-        query   = clf.get("query") or text
-        filters = clf.get("filters") or {}
-        emit(CustomEvent(name="intent", value={"intent": intent, "query": query, "filters": filters}))
+        if image_data:
+            # Image queries bypass the LLM classifier — always visual search
+            intent  = "search"
+            query   = text or "find visually similar products"
+            filters = {}
+            emit(CustomEvent(name="intent", value={"intent": "image", "query": query, "filters": filters}))
+        else:
+            clf     = classify(text, history)
+            intent  = clf["intent"]
+            query   = clf.get("query") or text
+            filters = clf.get("filters") or {}
+            emit(CustomEvent(name="intent", value={"intent": intent, "query": query, "filters": filters}))
         emit(StepFinishedEvent(step_name="classify"))
 
         # ── Personalization preference update ─────────────────────────────
@@ -206,9 +244,9 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
 
         # ── Retrieve ───────────────────────────────────────────────────────
         products = []
-        if intent in ("search", "qa", "compare", "gift_search"):
+        if intent in ("search", "qa", "compare", "gift_search") or image_data:
             emit(StepStartedEvent(step_name="retrieve"))
-            products = _retrieve(query, intent)
+            products = _retrieve(query, intent, image_data=image_data)
             if update_profile:
                 try:
                     update_profile(session_id, products)

@@ -29,7 +29,7 @@ If no products match, say: "I couldn't find an exact match — try searching for
 
 
 def _format_context(products: list[Product]) -> str:
-    from rufus.reviews import get_meta
+    from rufus.reviews import get_meta, get_reviews
     lines: list[str] = []
     for i, p in enumerate(products, 1):
         line = f"{i}. **{p.title}**"
@@ -38,7 +38,6 @@ def _format_context(products: list[Product]) -> str:
         if p.color:
             line += f", Color: {p.color}"
 
-        # Enrich with Amazon Reviews metadata if available
         meta = get_meta(p.product_id)
         if meta:
             if meta.get("price"):
@@ -50,7 +49,6 @@ def _format_context(products: list[Product]) -> str:
 
         line += f" (relevance: {p.score:.2f})"
 
-        # Features: top 2 only to keep context tight
         features = None
         if meta and meta.get("features"):
             features = " • ".join(meta["features"][:2])
@@ -58,6 +56,13 @@ def _format_context(products: list[Product]) -> str:
             features = p.bullet_point.replace("\n", " ").strip()[:150]
         if features:
             line += f"\n   Features: {features}"
+        elif meta and meta.get("description"):
+            line += f"\n   About: {meta['description'][:200]}"
+
+        # Top helpful review snippet for richer Q&A grounding
+        snippets = get_reviews(p.product_id, limit=1)
+        if snippets:
+            line += f'\n   Review: "{snippets[0]}"'
 
         lines.append(line)
     return "\n".join(lines)

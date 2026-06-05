@@ -298,8 +298,11 @@ Verified timings on RTX 5090:
 - **Week 6 ✅** AG-UI server + streaming frontend, supply chain layer, mock features, hardware optimisation
 
 **Remaining / in progress:**
-- Review summarization — `rufus_reviews.db` populated, need to wire into RAG context
-- Image search — CLIP collection ready, need to extract base64 from AG-UI message
 - Demand forecast model training at scale (statsforecast AutoETS on full M5)
 - Personalization from real clickstream (RetailRocket + Instacart ingestion)
-- Price display — in metadata, need to surface in product cards UI
+
+**Completed this session:**
+- Review summarization — `reviews.py` now uses `rufus_reviews.db` (5.5M ASINs, 33 categories); `_format_context()` includes top helpful review snippet per product
+- Image search — base64 image extracted from AG-UI messages; routed to `CLIPRetriever.retrieve_by_image()` via RRF fusion
+- Price/rating display — product cards now show `$XX.XX` and `⭐ X.X (N)` from reviews DB
+- DataCo ingestion — `scripts/ingest_dataco.py` builds inventory + demand history from 180K supply chain records
