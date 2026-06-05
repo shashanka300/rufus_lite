@@ -132,7 +132,7 @@ def train_m5(n_skus: int = 0) -> None:
     df  = pd.read_csv(sales_path)
     cal = pd.read_csv(cal_path, usecols=["date"])
 
-    id_cols  = ["id", "item_id", "dept_id", "cat_id", "store_id", "state_id"]
+    id_cols  = [c for c in ["item_id", "dept_id", "cat_id", "store_id", "state_id"] if c in df.columns]
     day_cols = [c for c in df.columns if c.startswith("d_")]
 
     # Map d_N column -> calendar date
@@ -180,9 +180,13 @@ def train_m5(n_skus: int = 0) -> None:
     }
     del df_melt  # free memory
 
-    skus     = list(grouped.keys())
+    # Skip SKUs already forecasted (resume support)
+    with get_db() as conn:
+        done = {r[0] for r in conn.execute("SELECT DISTINCT sku FROM forecasts").fetchall()}
+    skus = [s for s in grouped if s not in done]
+
     total_fc = 0
-    console.print(f"  {len(skus):,} SKUs have >= 14 days of history")
+    console.print(f"  {len(grouped):,} total M5 SKUs  |  {len(skus):,} not yet forecasted")
     with Progress(SpinnerColumn(), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn()) as prog:
         task = prog.add_task("  Forecasting M5 ...", total=len(skus))
         for i in range(0, len(skus), CHUNK):
@@ -213,8 +217,11 @@ def train_from_history(n_skus: int = 0) -> None:
     df = pd.DataFrame(rows, columns=["sku", "date", "units"])
     df["date"] = pd.to_datetime(df["date"])
 
-    top_skus = df.groupby("sku")["units"].sum().nlargest(n_skus or len(df["sku"].unique())).index.tolist()
-    console.print(f"  {len(top_skus):,} SKUs to forecast")
+    all_skus = df.groupby("sku")["units"].sum().nlargest(n_skus or len(df["sku"].unique())).index.tolist()
+    with get_db() as conn:
+        done = {r[0] for r in conn.execute("SELECT DISTINCT sku FROM forecasts").fetchall()}
+    top_skus = [s for s in all_skus if s not in done]
+    console.print(f"  {len(all_skus):,} total SKUs  |  {len(top_skus):,} not yet forecasted")
 
     total_fc = 0
     with Progress(SpinnerColumn(), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn()) as prog:
