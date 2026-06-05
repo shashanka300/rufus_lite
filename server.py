@@ -115,25 +115,40 @@ def _get_reranker():
     return _reranker_instance
 
 
-def _retrieve(query: str, intent: str, top_k: int = 5, image_data: str | None = None) -> list:
+def _retrieve(
+    query: str,
+    intent: str,
+    top_k: int = 5,
+    image_data: str | None = None,
+    session_id: str = "",
+) -> list:
     from rufus.fusion import rrf_fuse
     pool = max(top_k * 8, 40)
     text_hits = _get_retriever().retrieve(query, top_k=pool)
     clip = _get_clip()
+
+    ranker_lists = [text_hits]
 
     if image_data and clip.available():
         import base64, io
         from PIL import Image as _Image
         _, b64 = image_data.split(",", 1)
         pil_img = _Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-        clip_hits = clip.retrieve_by_image(pil_img, top_k=pool)
-        candidates = rrf_fuse([text_hits, clip_hits], top_k=pool)
+        ranker_lists.append(clip.retrieve_by_image(pil_img, top_k=pool))
     elif intent in ("search", "qa", "compare") and clip.available():
-        clip_hits = clip.retrieve(query, top_k=pool)
-        candidates = rrf_fuse([text_hits, clip_hits], top_k=pool)
-    else:
-        candidates = text_hits
+        ranker_lists.append(clip.retrieve(query, top_k=pool))
 
+    # Blend in session-based similar-to-viewed results (personalization signal)
+    if session_id and intent in ("search", "followup", "qa"):
+        try:
+            from rufus.personalization import get_similar_to_viewed
+            viewed_hits = get_similar_to_viewed(session_id, top_k=pool // 4)
+            if viewed_hits:
+                ranker_lists.append(viewed_hits)
+        except Exception:
+            pass
+
+    candidates = rrf_fuse(ranker_lists, top_k=pool) if len(ranker_lists) > 1 else text_hits
     reranked = _get_reranker().rerank(query, candidates, top_k=top_k * 2)
     return reranked[:top_k]
 
@@ -251,7 +266,7 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
         products = []
         if intent in ("search", "qa", "compare", "gift_search") or image_data:
             emit(StepStartedEvent(step_name="retrieve"))
-            products = _retrieve(query, intent, image_data=image_data)
+            products = _retrieve(query, intent, image_data=image_data, session_id=session_id)
             if update_profile:
                 try:
                     update_profile(session_id, products)

@@ -1,41 +1,42 @@
 """
-User personalization — preference tracking + rerank bias.
+User personalization — real session-based preference tracking + rerank bias.
 
-Storage: SQLite table in rufus_sc.db (same DB as inventory).
-Profiles accumulate brand/category affinity from click history.
-When no real history exists, synthetic seed profiles are used so
-the feature works immediately without requiring user interaction.
+Three complementary signals:
+  1. Brand / category affinity — accumulated from products shown this session
+  2. Viewed-product similarity — Qdrant ANN on the user's viewed product vectors
+  3. Seed profiles — deterministic fallback for new sessions with no history
+
+Storage: user_profiles table in rufus_sc.db (same DB as inventory).
 
 Ingested supporting data (rufus_personalization.db):
-  item_popularity  -- 235K items with view/cart/purchase counts from RetailRocket
-  co_view          -- 500K co-viewed item pairs from RetailRocket sessions
-  basket_copurchase -- 1M co-purchased pairs from Instacart (3.4M orders)
-  product_popularity -- 49K Instacart product purchase counts
+  item_popularity   — 235K items with view/cart/purchase counts (RetailRocket)
+  co_view           — 500K co-viewed item pairs (RetailRocket sessions)
+  basket_copurchase — 1M co-purchased pairs (Instacart 3.4M orders)
+  product_popularity — 49K Instacart product purchase counts
 """
 
 from __future__ import annotations
 
 import json
-import random
+from datetime import datetime
 from pathlib import Path
 
 from rufus.inventory import get_db
 
-# ── Schema ────────────────────────────────────────────────────────────────────
-
 _DDL = """
 CREATE TABLE IF NOT EXISTS user_profiles (
-    session_id   TEXT PRIMARY KEY,
-    brand_prefs  TEXT DEFAULT '{}',   -- JSON: {brand: click_count}
-    cat_prefs    TEXT DEFAULT '{}',   -- JSON: {category: click_count}
-    price_min    REAL DEFAULT 0,
-    price_max    REAL DEFAULT 999,
-    updated_at   TEXT
+    session_id         TEXT PRIMARY KEY,
+    brand_prefs        TEXT DEFAULT '{}',
+    cat_prefs          TEXT DEFAULT '{}',
+    price_min          REAL DEFAULT 0,
+    price_max          REAL DEFAULT 999,
+    viewed_product_ids TEXT DEFAULT '[]',
+    updated_at         TEXT
 );
 """
 
-# Synthetic seed profiles — rotate by session hash so different users
-# get different personas without requiring real history.
+_MAX_VIEWED = 20   # keep last N viewed product IDs per session
+
 _SEED_PROFILES = [
     {"brand_prefs": {"Sony": 5, "Apple": 3, "Samsung": 2},
      "cat_prefs":   {"electronics": 8, "headphones": 4},
@@ -61,7 +62,6 @@ def _init() -> None:
 
 
 def get_profile(session_id: str) -> dict:
-    """Return user preference profile, seeding a synthetic one if none exists."""
     _init()
     with get_db() as conn:
         row = conn.execute(
@@ -70,47 +70,54 @@ def get_profile(session_id: str) -> dict:
 
     if row:
         return {
-            "brand_prefs": json.loads(row["brand_prefs"] or "{}"),
-            "cat_prefs":   json.loads(row["cat_prefs"]   or "{}"),
-            "price_min":   row["price_min"],
-            "price_max":   row["price_max"],
-            "is_mock":     False,
+            "brand_prefs":        json.loads(row["brand_prefs"]        or "{}"),
+            "cat_prefs":          json.loads(row["cat_prefs"]          or "{}"),
+            "price_min":          row["price_min"],
+            "price_max":          row["price_max"],
+            "viewed_product_ids": json.loads(row["viewed_product_ids"] or "[]"),
+            "is_mock": False,
         }
 
-    # Seed a deterministic synthetic profile based on session hash
     seed = _SEED_PROFILES[hash(session_id) % len(_SEED_PROFILES)]
-    return {**seed, "is_mock": True}
+    return {**seed, "viewed_product_ids": [], "is_mock": True}
 
 
 def update_profile(session_id: str, products: list) -> None:
-    """Increment brand/category affinity for products shown to user."""
+    """Accumulate brand/category affinity and viewed product IDs from shown results."""
     if not products:
         return
     _init()
-    profile = get_profile(session_id)
-    brand_p = profile.get("brand_prefs", {})
-    cat_p   = profile.get("cat_prefs",   {})
+    profile  = get_profile(session_id)
+    brand_p  = profile.get("brand_prefs", {})
+    cat_p    = profile.get("cat_prefs",   {})
+    viewed   = profile.get("viewed_product_ids", [])
 
     for p in products:
         brand = getattr(p, "brand", None) or (p.get("brand") if isinstance(p, dict) else None)
         cat   = getattr(p, "category", None) or (p.get("category") if isinstance(p, dict) else None)
+        pid   = getattr(p, "product_id", None) or (p.get("product_id") if isinstance(p, dict) else None)
         if brand:
             brand_p[brand] = brand_p.get(brand, 0) + 1
         if cat:
             cat_p[cat] = cat_p.get(cat, 0) + 1
+        if pid and pid not in viewed:
+            viewed.append(pid)
 
-    from datetime import datetime
+    viewed = viewed[-_MAX_VIEWED:]  # keep only most recent
+
     with get_db() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO user_profiles
-               (session_id, brand_prefs, cat_prefs, price_min, price_max, updated_at)
-               VALUES (?,?,?,?,?,?)""",
+               (session_id, brand_prefs, cat_prefs, price_min, price_max,
+                viewed_product_ids, updated_at)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 session_id,
                 json.dumps(brand_p),
                 json.dumps(cat_p),
                 profile.get("price_min", 0),
                 profile.get("price_max", 999),
+                json.dumps(viewed),
                 datetime.utcnow().isoformat(),
             ),
         )
@@ -118,14 +125,16 @@ def update_profile(session_id: str, products: list) -> None:
 
 def apply_preference_bias(products: list, session_id: str, weight: float = 0.15) -> list:
     """
-    Boost relevance scores for products matching user's brand/category preferences.
-    weight=0.15 means a preferred brand can add up to 15% to the score.
+    Boost relevance scores for products matching the user's brand/category profile.
+    weight=0.15 → a preferred brand adds up to 15% to the score.
     """
     if not products:
         return products
+
     profile = get_profile(session_id)
     brand_p = profile.get("brand_prefs", {})
     cat_p   = profile.get("cat_prefs",   {})
+
     if not brand_p and not cat_p:
         return products
 
@@ -142,7 +151,6 @@ def apply_preference_bias(products: list, session_id: str, weight: float = 0.15)
         if cat and cat in cat_p:
             boost += weight * 0.5 * (cat_p[cat] / max_cat)
         if boost > 0:
-            # Products are dataclass-like — set score via object copy or dict
             try:
                 from dataclasses import replace
                 p = replace(p, score=min(p.score + boost, 1.0))
@@ -154,13 +162,89 @@ def apply_preference_bias(products: list, session_id: str, weight: float = 0.15)
     return boosted
 
 
-def preference_summary(session_id: str) -> str:
-    """Human-readable summary of user preferences for LLM context."""
+def get_similar_to_viewed(session_id: str, top_k: int = 5) -> list:
+    """
+    Return products semantically similar to what this session has viewed.
+
+    Uses BGE-M3 Qdrant to find nearest neighbours of the viewed product
+    vectors — a lightweight collaborative filtering signal.
+    Requires the Qdrant server to be running.
+    """
     profile = get_profile(session_id)
-    brands = sorted(profile.get("brand_prefs", {}).items(), key=lambda x: -x[1])[:3]
-    cats   = sorted(profile.get("cat_prefs",   {}).items(), key=lambda x: -x[1])[:2]
-    p_min  = profile.get("price_min", 0)
-    p_max  = profile.get("price_max", 999)
+    viewed  = profile.get("viewed_product_ids", [])
+    if not viewed:
+        return []
+
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchAny
+        from rufus.qdrant import get_client
+        from rufus.retriever import Product
+
+        client = get_client()
+
+        # Fetch vectors for the viewed products
+        results = client.retrieve(
+            collection_name="rufus_products",
+            ids=[],          # we'll use scroll + filter instead
+            with_vectors=True,
+            with_payload=True,
+        )
+        # Use scroll to find the viewed products by payload product_id
+        candidate_vecs: list[list[float]] = []
+        for pid in viewed[-5:]:   # use last 5 viewed
+            pts, _ = client.scroll(
+                collection_name="rufus_products",
+                scroll_filter=Filter(must=[
+                    FieldCondition(key="product_id", match=MatchAny(any=[pid]))
+                ]),
+                limit=1,
+                with_vectors=True,
+                with_payload=False,
+            )
+            if pts and pts[0].vector:
+                candidate_vecs.append(pts[0].vector)
+
+        if not candidate_vecs:
+            return []
+
+        # Average the viewed vectors → personal taste centroid
+        import numpy as np
+        centroid = np.mean(candidate_vecs, axis=0).tolist()
+
+        hits = client.query_points(
+            collection_name="rufus_products",
+            query=centroid,
+            limit=top_k * 2,
+        )
+
+        products = [
+            Product(
+                product_id=h.payload.get("product_id", ""),
+                title=h.payload.get("product_title", ""),
+                brand=h.payload.get("product_brand"),
+                color=h.payload.get("product_color"),
+                bullet_point=h.payload.get("product_bullet_point"),
+                description=None,
+                locale=h.payload.get("product_locale", "us"),
+                score=h.score,
+                image_url=h.payload.get("image_url"),
+            )
+            for h in hits.points
+            if h.payload.get("product_id") not in viewed
+        ]
+        return products[:top_k]
+
+    except Exception:
+        return []
+
+
+def preference_summary(session_id: str) -> str:
+    profile = get_profile(session_id)
+    brands  = sorted(profile.get("brand_prefs", {}).items(), key=lambda x: -x[1])[:3]
+    cats    = sorted(profile.get("cat_prefs",   {}).items(), key=lambda x: -x[1])[:2]
+    p_min   = profile.get("price_min", 0)
+    p_max   = profile.get("price_max", 999)
+    viewed  = profile.get("viewed_product_ids", [])
 
     parts = []
     if brands:
@@ -168,7 +252,9 @@ def preference_summary(session_id: str) -> str:
     if cats:
         parts.append(f"Often shops: {', '.join(c for c, _ in cats)}")
     if p_max < 900:
-        parts.append(f"Typical price range: ${p_min:.0f}–${p_max:.0f}")
+        parts.append(f"Typical price range: ${p_min:.0f}-${p_max:.0f}")
+    if viewed:
+        parts.append(f"Viewed {len(viewed)} product(s) this session")
     if profile.get("is_mock"):
         parts.append("(inferred preferences)")
     return " | ".join(parts) if parts else ""

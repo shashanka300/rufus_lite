@@ -34,6 +34,10 @@ def rrf_fuse(result_lists: list[list[Product]], top_k: int = 5) -> list[Product]
             scores[pid] = scores.get(pid, 0.0) + 1.0 / (RRF_K + rank + 1)
             if pid not in best or product.score > best[pid].score:
                 best[pid] = product
+            # Keep image_url from whichever source has one — CLIP has verified URLs
+            # for 156K SQID products; BGE-M3 never stores image_url in Qdrant.
+            if product.image_url and not best[pid].image_url:
+                best[pid] = dataclasses.replace(best[pid], image_url=product.image_url)
 
     fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
     return [
