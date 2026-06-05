@@ -171,20 +171,24 @@ def train_m5(n_skus: int = 0) -> None:
         )
     console.print(f"  demand_history (M5): {len(hist_rows):,} rows")
 
-    # Forecast in chunks
-    skus   = df_melt["sku"].unique().tolist()
+    # Build grouped series in one pass (avoid per-SKU DataFrame scan)
+    console.print("  Grouping by SKU for forecasting ...")
+    grouped = {
+        sku: grp.set_index("date")["units"]
+        for sku, grp in df_melt.groupby("sku")
+        if len(grp) >= 14
+    }
+    del df_melt  # free memory
+
+    skus     = list(grouped.keys())
     total_fc = 0
+    console.print(f"  {len(skus):,} SKUs have >= 14 days of history")
     with Progress(SpinnerColumn(), BarColumn(), MofNCompleteColumn(), TimeElapsedColumn()) as prog:
         task = prog.add_task("  Forecasting M5 ...", total=len(skus))
         for i in range(0, len(skus), CHUNK):
-            batch_skus = skus[i : i + CHUNK]
-            series_map: dict[str, pd.Series] = {}
-            for sku in batch_skus:
-                s = df_melt[df_melt["sku"] == sku].set_index("date")["units"]
-                if len(s) >= 14:
-                    series_map[sku] = s
-            if series_map:
-                total_fc += _forecast_and_store(series_map, HORIZON)
+            batch_skus  = skus[i : i + CHUNK]
+            series_map  = {s: grouped[s] for s in batch_skus}
+            total_fc   += _forecast_and_store(series_map, HORIZON)
             prog.advance(task, len(batch_skus))
 
     console.print(f"  [green]M5 forecast rows stored: {total_fc:,}[/green]")
