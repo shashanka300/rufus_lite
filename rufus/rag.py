@@ -29,7 +29,9 @@ If no products match, say: "I couldn't find an exact match — try searching for
 
 
 def _format_context(products: list[Product]) -> str:
-    from rufus.reviews import get_meta, get_reviews
+    from rufus.reviews import get_c4_metadata_batch, get_meta, get_reviews
+    ids     = [p.product_id for p in products]
+    c4_map  = get_c4_metadata_batch(ids)
     lines: list[str] = []
     for i, p in enumerate(products, 1):
         line = f"{i}. **{p.title}**"
@@ -58,6 +60,8 @@ def _format_context(products: list[Product]) -> str:
             line += f"\n   Features: {features}"
         elif meta and meta.get("description"):
             line += f"\n   About: {meta['description'][:200]}"
+        elif c4_map.get(p.product_id):
+            line += f"\n   About: {c4_map[p.product_id][:250]}"
 
         # Top helpful review snippet for richer Q&A grounding
         snippets = get_reviews(p.product_id, limit=1)

@@ -215,6 +215,32 @@ def get_reviews(product_id: str, limit: int = 2) -> list[str]:
     return [r[0][:150] for r in rows if r[0]]
 
 
+def get_c4_metadata(product_id: str) -> str | None:
+    """Return Amazon C4 rich description for an ASIN (up to 500 chars)."""
+    if not DB_PATH.exists():
+        return None
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        "SELECT metadata FROM c4_metadata WHERE asin = ?", (product_id,)
+    ).fetchone()
+    conn.close()
+    return row[0][:500] if row and row[0] else None
+
+
+def get_c4_metadata_batch(product_ids: list[str]) -> dict[str, str]:
+    """Batch C4 description lookup; returns {asin: metadata_snippet}."""
+    if not product_ids or not DB_PATH.exists():
+        return {}
+    placeholders = ",".join("?" * len(product_ids))
+    conn = sqlite3.connect(str(DB_PATH))
+    rows = conn.execute(
+        f"SELECT asin, metadata FROM c4_metadata WHERE asin IN ({placeholders})",
+        product_ids,
+    ).fetchall()
+    conn.close()
+    return {r[0]: r[1][:500] for r in rows if r[1]}
+
+
 def meta_available() -> bool:
     _ensure_loaded()
     return bool(_META)

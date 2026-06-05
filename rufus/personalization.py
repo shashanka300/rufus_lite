@@ -6,9 +6,11 @@ Profiles accumulate brand/category affinity from click history.
 When no real history exists, synthetic seed profiles are used so
 the feature works immediately without requiring user interaction.
 
-Real personalization data (RetailRocket, Instacart) is on disk at
-data/personalization/ but ingestion is not yet built; this module
-provides a working mock that can be replaced with a real signal later.
+Ingested supporting data (rufus_personalization.db):
+  item_popularity  -- 235K items with view/cart/purchase counts from RetailRocket
+  co_view          -- 500K co-viewed item pairs from RetailRocket sessions
+  basket_copurchase -- 1M co-purchased pairs from Instacart (3.4M orders)
+  product_popularity -- 49K Instacart product purchase counts
 """
 
 from __future__ import annotations
