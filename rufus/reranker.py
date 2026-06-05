@@ -15,6 +15,7 @@ import time
 
 import torch
 
+import rufus.hardware  # apply TF32 + cuDNN benchmark globally
 from rufus.retriever import Product
 
 MODEL_NAME = "BAAI/bge-reranker-v2-m3"
@@ -47,6 +48,7 @@ class ProductReranker:
                 self.model_name,
                 device=self._device,
                 max_length=512,
+                automodel_args={"torch_dtype": torch.float16},  # fp16 on RTX 5090
             )
         return self._model
 
@@ -63,9 +65,9 @@ class ProductReranker:
 
         t0 = time.perf_counter()
         pairs = [(query, _product_passage(p)) for p in products]
-        scores = self.model.predict(pairs, show_progress_bar=False, batch_size=32)
+        scores = self.model.predict(pairs, show_progress_bar=False, batch_size=128)  # 32 GB VRAM
         print(f"[rerank] {time.perf_counter()-t0:.2f}s  "
-              f"({len(products)} → {top_k} products, device={self._device})")
+              f"({len(products)} -> {top_k} products, device={self._device})")
 
         ranked = sorted(zip(scores, products), key=lambda x: x[0], reverse=True)
         result = [dataclasses.replace(p, score=float(s)) for s, p in ranked[:top_k]]

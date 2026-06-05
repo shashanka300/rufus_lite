@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+import rufus.hardware  # apply TF32 + cuDNN benchmark globally
 from rufus.retriever import Product
 
 CLIP_MODEL_NAME = "openai/clip-vit-large-patch14"
@@ -39,7 +40,9 @@ class CLIPRetriever:
     def _load_model(self) -> None:
         from transformers import CLIPModel, CLIPProcessor
         self._processor = CLIPProcessor.from_pretrained(self.model_name)
-        self._model = CLIPModel.from_pretrained(self.model_name).to(self._device)
+        self._model = CLIPModel.from_pretrained(
+            self.model_name, torch_dtype=torch.float16   # fp16 for ViT-L/14 on RTX 5090
+        ).to(self._device)
         self._model.eval()
 
     def encode_text(self, text: str) -> list[float]:

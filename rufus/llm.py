@@ -28,7 +28,7 @@ from collections.abc import Iterator
 
 import ollama
 
-DEFAULT_MODEL   = "qwen3.5:latest"
+DEFAULT_MODEL   = "qwen3:1.7b"   # qwen3.5:latest routes output to thinking field, not content
 TIMEOUT_SECS    = 45       # max time to wait for a single chat call
 MAX_RETRIES     = 2        # attempts after first failure (total = 3)
 BASE_BACKOFF    = 0.5      # seconds, doubled each retry
@@ -83,6 +83,14 @@ _breaker = _CircuitBreaker(FAILURE_THRESH, RECOVERY_SECS)
 
 def _chat_with_retry(model: str, messages: list[dict], stream: bool) -> any:
     """Single attempt wrapped in retry loop with exponential backoff + jitter."""
+    # Do NOT set think:False for qwen3 — it routes output to `thinking` field
+    # and leaves `content` empty. Without it, thinking goes to `thinking` field
+    # and the final answer goes to `content` (correct behaviour).
+    opts: dict = {"timeout": TIMEOUT_SECS, "num_ctx": 2048, "num_predict": 512, "temperature": 0}
+    # think=False as a direct kwarg (NOT inside options) suppresses CoT for qwen3.
+    # Passing it inside options routes output to the thinking field instead.
+    kwargs = {"options": opts, "keep_alive": "60m", "think": False}
+
     last_exc = None
     for attempt in range(MAX_RETRIES + 1):
         if attempt > 0:
@@ -91,11 +99,9 @@ def _chat_with_retry(model: str, messages: list[dict], stream: bool) -> any:
             time.sleep(sleep)
         try:
             if stream:
-                return ollama.chat(model=model, messages=messages,
-                                   stream=True, options={"timeout": TIMEOUT_SECS})
-            resp = ollama.chat(model=model, messages=messages,
-                               options={"num_ctx": 4096, "timeout": TIMEOUT_SECS})
-            return resp.message.content
+                return ollama.chat(model=model, messages=messages, stream=True, **kwargs)
+            resp = ollama.chat(model=model, messages=messages, **kwargs)
+            return resp.message.content or ""
         except Exception as exc:
             last_exc = exc
             print(f"[llm] attempt {attempt+1} failed: {exc}")
@@ -133,11 +139,13 @@ class OllamaClient:
             return None
 
     def _wrap_stream(self, raw_stream) -> Iterator[str]:
-        """Yield tokens; record breaker success/failure on completion."""
+        """Yield content tokens only — thinking tokens go to chunk.message.thinking
+        and are intentionally skipped so CoT never leaks into the UI."""
         try:
             for chunk in raw_stream:
-                if chunk.message.content:
-                    yield chunk.message.content
+                token = chunk.message.content
+                if token:
+                    yield token
             _breaker.record_success()
         except Exception as exc:
             _breaker.record_failure()

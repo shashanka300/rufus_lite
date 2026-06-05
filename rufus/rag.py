@@ -10,15 +10,21 @@ from rufus.llm import OllamaClient
 from rufus.retriever import Product, ProductRetriever
 
 SYSTEM_PROMPT = """\
-You are Rufus, an AI shopping assistant. You help customers find products, \
-answer questions about items, and make recommendations based on their needs.
+You are Rufus, an Amazon-style AI shopping assistant.
 
-You are given a list of relevant products retrieved from the catalog. \
-Use ONLY the provided product information to answer — do not invent specs, \
-prices, or features. If none of the products match the customer's need, \
-say so clearly and suggest what to search for instead.
+RULES — follow every time, no exceptions:
+1. Use ONLY the product data provided. Never invent specs, prices, or features.
+2. Always format product names in **bold**.
+3. Keep answers under 120 words.
+4. Do not start with "I" or "Sure" or "Of course" or "Great question".
+5. Do not repeat the user's question back to them.
 
-Be concise, helpful, and direct. Format product names in **bold**.\
+OUTPUT FORMAT by intent:
+- search / compare: numbered list, one product per line, key feature + price if available
+- qa / followup: 1-2 sentences answering the specific question
+- chitchat: 1 sentence, friendly
+
+If no products match, say: "I couldn't find an exact match — try searching for [better keywords]."\
 """
 
 
@@ -44,22 +50,14 @@ def _format_context(products: list[Product]) -> str:
 
         line += f" (relevance: {p.score:.2f})"
 
-        # Features: prefer reviews metadata features over ESCI bullet points
+        # Features: top 2 only to keep context tight
         features = None
         if meta and meta.get("features"):
-            features = " • ".join(meta["features"][:4])
+            features = " • ".join(meta["features"][:2])
         elif p.bullet_point:
-            features = p.bullet_point.replace("\n", " ").strip()[:300]
+            features = p.bullet_point.replace("\n", " ").strip()[:150]
         if features:
             line += f"\n   Features: {features}"
-
-        # Description: from reviews metadata (richer than ESCI)
-        desc = (meta or {}).get("description") or p.description
-        if desc:
-            line += f"\n   Description: {str(desc)[:300]}"
-
-        if meta and meta.get("categories"):
-            line += f"\n   Category: {' > '.join(meta['categories'][:3])}"
 
         lines.append(line)
     return "\n".join(lines)

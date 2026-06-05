@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Rufus — Shopping Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    #messages { scroll-behavior: smooth; }
+    .step-badge { animation: pulse 1.5s ease-in-out infinite; }
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.5 } }
+    .product-card:hover { transform: translateY(-2px); transition: transform .2s; }
+    .typing-cursor::after { content:'▋'; animation: blink 1s step-end infinite; }
+    @keyframes blink { 0%,100% { opacity:1 } 50% { opacity:0 } }
+    .prose { line-height: 1.7; }
+    .prose strong { font-weight: 600; }
+    pre { background: #f1f5f9; border-radius: 6px; padding: 12px; overflow-x: auto; }
+    code { font-family: 'Menlo', monospace; font-size: .88em; }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen flex flex-col">
+
+<!-- Header -->
+<header class="bg-white border-b border-slate-200 px-6 py-3 flex items-center gap-3 sticky top-0 z-10">
+  <span class="text-2xl">🛍️</span>
+  <h1 class="text-lg font-semibold text-slate-800">Rufus</h1>
+  <span class="text-sm text-slate-400">— local shopping assistant</span>
+  <div class="ml-auto flex items-center gap-2">
+    <span id="status-dot" class="w-2 h-2 rounded-full bg-slate-300"></span>
+    <span id="status-text" class="text-xs text-slate-400">connecting…</span>
+    <button onclick="newSession()"
+      class="ml-4 text-xs px-3 py-1 rounded-md border border-slate-200 hover:bg-slate-50 text-slate-500">
+      New session
+    </button>
+  </div>
+</header>
+
+<!-- Main layout -->
+<div class="flex flex-1 overflow-hidden" style="height:calc(100vh - 57px)">
+
+  <!-- Chat column -->
+  <div class="flex flex-col flex-1 min-w-0">
+
+    <!-- Messages -->
+    <div id="messages" class="flex-1 overflow-y-auto px-4 py-4 space-y-4">
+      <div id="welcome" class="text-center py-16 text-slate-400">
+        <div class="text-5xl mb-4">🛍️</div>
+        <p class="text-lg font-medium text-slate-600">Ask me anything about products</p>
+        <p class="text-sm mt-1">Search by text, or attach an image to search visually</p>
+      </div>
+    </div>
+
+    <!-- Input area -->
+    <div class="border-t border-slate-200 bg-white p-4">
+      <!-- Image preview -->
+      <div id="img-preview-wrap" class="hidden mb-2 flex items-center gap-2">
+        <img id="img-preview" class="h-16 w-16 object-cover rounded-lg border border-slate-200" />
+        <div class="flex-1">
+          <p id="img-name" class="text-xs text-slate-500 truncate"></p>
+          <p class="text-xs text-slate-400">Image attached — add text or press Enter to search</p>
+        </div>
+        <button onclick="clearImage()" class="text-slate-400 hover:text-red-400 text-lg leading-none">×</button>
+      </div>
+
+      <div class="flex items-end gap-2">
+        <!-- Attach image -->
+        <label class="cursor-pointer flex-shrink-0 text-slate-400 hover:text-slate-600 pb-2">
+          <input type="file" id="img-input" accept="image/*" class="hidden" onchange="attachImage(this)" />
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+          </svg>
+        </label>
+
+        <textarea id="input" rows="1"
+          placeholder="What are you looking for?"
+          class="flex-1 resize-none rounded-xl border border-slate-200 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-slate-50"
+          onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+
+        <button onclick="sendMessage()"
+          class="flex-shrink-0 bg-blue-600 hover:bg-blue-700 text-white rounded-xl px-4 py-3 text-sm font-medium disabled:opacity-40 transition-colors"
+          id="send-btn">
+          Send
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right panel — Query details -->
+  <aside class="w-72 border-l border-slate-200 bg-white flex flex-col overflow-y-auto p-4 gap-4 hidden md:flex">
+    <div>
+      <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">Query Details</h2>
+      <div id="panel-intent" class="hidden mb-2"></div>
+      <div id="panel-query" class="hidden text-xs text-slate-500 italic mb-1"></div>
+      <div id="panel-filters" class="hidden"></div>
+      <div id="panel-timing" class="hidden text-xs text-slate-400 mt-2"></div>
+    </div>
+
+    <div class="border-t border-slate-100 pt-4">
+      <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">Pipeline steps</h2>
+      <div id="panel-steps" class="space-y-1 text-xs text-slate-500">
+        <div class="flex items-center gap-2" id="step-classify">
+          <span class="w-2 h-2 rounded-full bg-slate-200"></span> Classify intent
+        </div>
+        <div class="flex items-center gap-2" id="step-retrieve">
+          <span class="w-2 h-2 rounded-full bg-slate-200"></span> Retrieve products
+        </div>
+        <div class="flex items-center gap-2" id="step-generate">
+          <span class="w-2 h-2 rounded-full bg-slate-200"></span> Generate answer
+        </div>
+      </div>
+    </div>
+
+    <div class="border-t border-slate-100 pt-4">
+      <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">Intent guide</h2>
+      <div class="space-y-2 text-xs">
+        <div class="flex items-center gap-2"><span class="px-2 py-0.5 rounded-full text-white text-[10px]" style="background:#1f77b4">search</span><span class="text-slate-500">Find products</span></div>
+        <div class="flex items-center gap-2"><span class="px-2 py-0.5 rounded-full text-white text-[10px]" style="background:#ff7f0e">followup</span><span class="text-slate-500">About shown products</span></div>
+        <div class="flex items-center gap-2"><span class="px-2 py-0.5 rounded-full text-white text-[10px]" style="background:#2ca02c">qa</span><span class="text-slate-500">Specific question</span></div>
+        <div class="flex items-center gap-2"><span class="px-2 py-0.5 rounded-full text-white text-[10px]" style="background:#9467bd">compare</span><span class="text-slate-500">Compare items</span></div>
+        <div class="flex items-center gap-2"><span class="px-2 py-0.5 rounded-full text-white text-[10px]" style="background:#7f7f7f">chitchat</span><span class="text-slate-500">General chat</span></div>
+        <div class="flex items-center gap-2"><span class="px-2 py-0.5 rounded-full text-white text-[10px]" style="background:#d62728">image</span><span class="text-slate-500">Visual search</span></div>
+      </div>
+    </div>
+
+    <div class="border-t border-slate-100 pt-4 mt-auto">
+      <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Cache stats</h2>
+      <div id="cache-stats" class="text-xs text-slate-400">—</div>
+    </div>
+  </aside>
+
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────
+
+const BADGE = {
+  search:   '#1f77b4', followup: '#ff7f0e', qa: '#2ca02c',
+  compare:  '#9467bd', chitchat: '#7f7f7f', image: '#d62728',
+};
+
+let threadId  = crypto.randomUUID();
+let history   = [];   // [{role, content}]
+let running   = false;
+let imgData   = null; // base64 string
+let imgFile   = null;
+let stepStart = {};   // stepName → Date.now()
+let timings   = {};
+
+// ── Session ───────────────────────────────────────────────────────────────
+
+function newSession() {
+  threadId = crypto.randomUUID();
+  history  = [];
+  imgData  = null;
+  document.getElementById('messages').innerHTML =
+    '<div class="text-center py-16 text-slate-400"><div class="text-5xl mb-4">🛍️</div><p class="text-lg font-medium text-slate-600">New session started</p></div>';
+  resetPanel();
+}
+
+// ── Image attachment ───────────────────────────────────────────────────────
+
+function attachImage(input) {
+  const file = input.files[0];
+  if (!file) return;
+  imgFile = file;
+  const reader = new FileReader();
+  reader.onload = e => {
+    imgData = e.target.result; // data:image/...;base64,...
+    document.getElementById('img-preview').src = imgData;
+    document.getElementById('img-name').textContent = file.name;
+    document.getElementById('img-preview-wrap').classList.remove('hidden');
+  };
+  reader.readAsDataURL(file);
+}
+
+function clearImage() {
+  imgData = null; imgFile = null;
+  document.getElementById('img-preview-wrap').classList.add('hidden');
+  document.getElementById('img-input').value = '';
+}
+
+// ── Input helpers ─────────────────────────────────────────────────────────
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+// ── UI builders ───────────────────────────────────────────────────────────
+
+function appendUserMsg(text, img) {
+  const wrap = document.createElement('div');
+  wrap.className = 'flex justify-end';
+  const bubble = document.createElement('div');
+  bubble.className = 'max-w-lg bg-blue-600 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm space-y-2';
+  if (img) {
+    const imgEl = document.createElement('img');
+    imgEl.src = img; imgEl.className = 'rounded-lg max-h-40 object-cover';
+    bubble.appendChild(imgEl);
+  }
+  if (text) {
+    const p = document.createElement('p'); p.textContent = text;
+    bubble.appendChild(p);
+  }
+  wrap.appendChild(bubble);
+  document.getElementById('messages').appendChild(wrap);
+  scrollBottom();
+  return wrap;
+}
+
+// Returns { stepsEl, productsEl, textEl } — no global ids, safe across queries
+function createAssistantBubble() {
+  const wrap = document.createElement('div');
+  wrap.className = 'flex flex-col gap-2';
+
+  const stepsEl = document.createElement('div');
+  stepsEl.className = 'flex gap-2 flex-wrap px-1';
+  wrap.appendChild(stepsEl);
+
+  const productsEl = document.createElement('div');
+  productsEl.className = 'hidden';
+  wrap.appendChild(productsEl);
+
+  const textEl = document.createElement('div');
+  textEl.className = 'max-w-2xl bg-white border border-slate-200 rounded-2xl rounded-tl-sm px-4 py-3 text-sm text-slate-700 shadow-sm';
+  textEl.innerHTML = '<span class="typing-cursor text-slate-400"></span>';
+  wrap.appendChild(textEl);
+
+  document.getElementById('messages').appendChild(wrap);
+  scrollBottom();
+  return { stepsEl, productsEl, textEl };
+}
+
+function renderProducts(productsEl, products) {
+  if (!productsEl || !products.length) return;
+  productsEl.className = 'overflow-x-auto';
+  productsEl.innerHTML = `
+    <div class="flex gap-3 pb-2 pt-1" style="min-width:max-content">
+      ${products.map(p => `
+        <div class="product-card w-44 flex-shrink-0 bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden cursor-pointer hover:border-blue-300 hover:shadow-md transition-all">
+          ${p.image_url
+            ? `<img src="${p.image_url}" alt="${p.title}" class="w-full h-32 object-cover" onerror="this.src='https://placehold.co/176x128?text=No+Image'" />`
+            : `<div class="w-full h-32 bg-slate-100 flex items-center justify-center text-slate-400 text-xs">No image</div>`
+          }
+          <div class="p-2">
+            <p class="text-xs font-medium text-slate-700 line-clamp-2 leading-tight">${p.title}</p>
+            ${p.brand ? `<p class="text-[10px] text-slate-400 mt-1">🏷 ${p.brand}</p>` : ''}
+            <p class="text-[10px] text-slate-300 mt-1">score ${p.score}</p>
+          </div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+  scrollBottom();
+}
+
+function setStep(name, state) {
+  const el = document.getElementById(`step-${name}`);
+  if (!el) return;
+  const dot = el.querySelector('span');
+  if (state === 'active') {
+    dot.className = 'w-2 h-2 rounded-full bg-blue-500 step-badge';
+    el.classList.add('text-slate-700', 'font-medium');
+  } else if (state === 'done') {
+    dot.className = 'w-2 h-2 rounded-full bg-green-500';
+    el.classList.remove('step-badge', 'font-medium');
+  } else {
+    dot.className = 'w-2 h-2 rounded-full bg-slate-200';
+    el.classList.remove('text-slate-700', 'font-medium', 'step-badge');
+  }
+}
+
+function resetPanel() {
+  ['classify','retrieve','generate'].forEach(s => setStep(s, 'idle'));
+  ['panel-intent','panel-query','panel-filters','panel-timing'].forEach(id => {
+    const el = document.getElementById(id);
+    el.className = el.className.replace('hidden','') + ' hidden';
+    el.innerHTML = '';
+  });
+  timings = {};
+}
+
+function updateStatus(ok) {
+  document.getElementById('status-dot').className =
+    `w-2 h-2 rounded-full ${ok ? 'bg-green-500' : 'bg-red-400'}`;
+  document.getElementById('status-text').textContent = ok ? 'ready' : 'error';
+}
+
+function scrollBottom() {
+  const el = document.getElementById('messages');
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Simple markdown renderer ───────────────────────────────────────────────
+
+function renderMarkdown(text) {
+  return text
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/`(.+?)`/g,'<code>$1</code>')
+    .replace(/\n/g,'<br/>');
+}
+
+// ── Send message ──────────────────────────────────────────────────────────
+
+async function sendMessage() {
+  const inputEl = document.getElementById('input');
+  const text = inputEl.value.trim();
+  if (!text && !imgData) return;
+  if (running) return;
+
+  running = true;
+  document.getElementById('send-btn').disabled = true;
+  document.getElementById('welcome')?.remove();
+  resetPanel();
+
+  inputEl.value = ''; inputEl.style.height = 'auto';
+  const snapshot = { text, img: imgData };
+  clearImage();
+
+  // Append user message
+  appendUserMsg(snapshot.text, snapshot.img);
+
+  // Build AG-UI message list
+  const userContent = snapshot.img
+    ? [
+        { type: 'image_url', image_url: { url: snapshot.img } },
+        ...(snapshot.text ? [{ type: 'text', text: snapshot.text }] : []),
+      ]
+    : snapshot.text;
+
+  history.push({ id: crypto.randomUUID(), role: 'user', content: userContent });
+
+  const runId = crypto.randomUUID();
+
+  // Create assistant bubble
+  const { stepsEl, productsEl, textEl } = createAssistantBubble();
+  let fullText = '';
+  let streaming = false;
+
+  try {
+    const response = await fetch('/awp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        threadId,
+        runId,
+        messages: history,
+        state: {},
+        tools: [],
+        context: [],
+        forwardedProps: {},
+      }),
+    });
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (!raw) continue;
+        let evt;
+        try { evt = JSON.parse(raw); } catch { continue; }
+
+        switch (evt.type) {
+
+          case 'RUN_STARTED':
+            updateStatus(true);
+            break;
+
+          case 'STEP_STARTED': {
+            stepStart[evt.stepName] = Date.now();
+            setStep(evt.stepName, 'active');
+            // Add inline step chip
+            const chip = document.createElement('span');
+            chip.id = `chip-${evt.stepName}`;
+            chip.className = 'step-badge inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-blue-50 text-blue-600 border border-blue-200';
+            chip.textContent = { classify:'🧠 Classifying', retrieve:'🔍 Retrieving', generate:'✍️ Generating' }[evt.stepName] || evt.stepName;
+            stepsEl.appendChild(chip);
+            break;
+          }
+
+          case 'STEP_FINISHED': {
+            const ms = Date.now() - (stepStart[evt.stepName] || 0);
+            timings[evt.stepName] = ms;
+            setStep(evt.stepName, 'done');
+            const chip = document.getElementById(`chip-${evt.stepName}`);
+            if (chip) {
+              chip.classList.remove('step-badge', 'bg-blue-50', 'text-blue-600', 'border-blue-200');
+              chip.classList.add('bg-green-50', 'text-green-700', 'border-green-200');
+              chip.textContent = chip.textContent.replace(/^../, '✅');
+            }
+            // Update timing panel
+            const t = document.getElementById('panel-timing');
+            t.className = t.className.replace(' hidden','');
+            t.textContent = Object.entries(timings).map(([k,v])=>`${k} ${v}ms`).join(' · ');
+            break;
+          }
+
+          case 'CUSTOM':
+            if (evt.name === 'intent') {
+              const { intent, query, filters } = evt.value;
+              const color = BADGE[intent] || '#888';
+              const panelIntent = document.getElementById('panel-intent');
+              panelIntent.className = panelIntent.className.replace(' hidden','');
+              panelIntent.innerHTML = `<span class="px-3 py-1 rounded-full text-white text-xs font-semibold" style="background:${color}">${intent}</span>`;
+
+              if (query && query !== document.getElementById('input').value) {
+                const panelQ = document.getElementById('panel-query');
+                panelQ.className = panelQ.className.replace(' hidden','');
+                panelQ.textContent = `"${query}"`;
+              }
+
+              const active = Object.entries(filters||{}).filter(([,v])=>v);
+              if (active.length) {
+                const pf = document.getElementById('panel-filters');
+                pf.className = pf.className.replace(' hidden','');
+                pf.innerHTML = active.map(([k,v])=>`<span class="inline-block mr-1 mb-1 px-2 py-0.5 bg-slate-100 text-slate-600 rounded text-[10px]">${k}: ${v}</span>`).join('');
+              }
+            }
+            if (evt.name === 'products') {
+              renderProducts(productsEl, evt.value);
+            }
+            break;
+
+          case 'TEXT_MESSAGE_START':
+            streaming = true;
+            textEl.innerHTML = '<span class="typing-cursor text-slate-400"></span>';
+            break;
+
+          case 'TEXT_MESSAGE_CONTENT':
+            if (streaming) {
+              fullText += evt.delta;
+              textEl.innerHTML = renderMarkdown(fullText) + '<span class="typing-cursor text-slate-400"></span>';
+              scrollBottom();
+            }
+            break;
+
+          case 'TEXT_MESSAGE_END':
+            streaming = false;
+            textEl.innerHTML = renderMarkdown(fullText);
+            textEl.classList.remove('typing-cursor');
+            history.push({ id: crypto.randomUUID(), role: 'assistant', content: fullText });
+            break;
+
+          case 'RUN_FINISHED':
+            updateStatus(true);
+            break;
+
+          case 'RUN_ERROR':
+            textEl.innerHTML = `<span class="text-red-500">⚠️ ${evt.message}</span>`;
+            updateStatus(false);
+            break;
+        }
+      }
+    }
+  } catch (err) {
+    textEl.innerHTML = `<span class="text-red-500">⚠️ Connection error: ${err.message}</span>`;
+    updateStatus(false);
+  } finally {
+    running = false;
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('input').focus();
+  }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+(async () => {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    updateStatus(d.status === 'ok');
+    if (d.collections) {
+      document.getElementById('cache-stats').textContent =
+        d.collections.map(c => c).join(', ');
+    }
+  } catch { updateStatus(false); }
+})();
+</script>
+</body>
+</html>

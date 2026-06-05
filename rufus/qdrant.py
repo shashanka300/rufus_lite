@@ -15,11 +15,25 @@ Start the server before launching the app:
 
 from __future__ import annotations
 
+import atexit
 from pathlib import Path
 
 from qdrant_client import QdrantClient
 
 _client: QdrantClient | None = None
+
+
+def _close_client() -> None:
+    global _client
+    if _client is not None:
+        try:
+            _client.close()
+        except Exception:
+            pass
+        _client = None
+
+
+atexit.register(_close_client)
 _LOCAL_PATH = Path("data/qdrant_storage")
 _SERVER_HOST = "localhost"
 _SERVER_PORT = 6333
@@ -30,6 +44,7 @@ def _try_server() -> QdrantClient | None:
         c = QdrantClient(
             host=_SERVER_HOST, port=_SERVER_PORT, grpc_port=6334,
             prefer_grpc=True, timeout=30,
+            check_compatibility=False,  # suppress version-mismatch warning at startup
         )
         c.get_collections()
         return c

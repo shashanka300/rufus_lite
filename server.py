@@ -1,0 +1,306 @@
+"""
+Rufus AG-UI Server — FastAPI backend implementing the Agent-User Interaction Protocol.
+
+Each query runs as a pipeline and emits AG-UI events over Server-Sent Events:
+
+  RunStarted
+  ├─ StepStarted("classify")
+  │    CustomEvent("intent", {intent, query, filters})
+  │  StepFinished("classify")
+  ├─ StepStarted("retrieve")          [search / qa / compare only]
+  │    CustomEvent("products", [...])
+  │  StepFinished("retrieve")
+  ├─ StepStarted("generate")
+  │    TextMessageStart
+  │    TextMessageContent × N         [streaming tokens]
+  │    TextMessageEnd
+  │  StepFinished("generate")
+  RunFinished
+
+Serve with:
+  .\\scripts\\start_qdrant.ps1        # terminal 1
+  uv run uvicorn server:app --reload  # terminal 2
+  open http://localhost:8000
+"""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+import uuid
+from pathlib import Path
+
+from ag_ui.core.events import (
+    CustomEvent,
+    RunAgentInput,
+    RunFinishedEvent,
+    RunStartedEvent,
+    StepFinishedEvent,
+    StepStartedEvent,
+    TextMessageContentEvent,
+    TextMessageEndEvent,
+    TextMessageStartEvent,
+)
+from ag_ui.encoder import EventEncoder
+import rufus.hardware  # apply TF32 + cuDNN benchmark at import time
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI(title="Rufus AG-UI Server")
+
+
+@app.on_event("startup")
+async def _warmup():
+    """Pre-load models into GPU on startup so the first request has no cold-start delay."""
+    import asyncio, ollama as _ollama
+    loop = asyncio.get_event_loop()
+    def _load():
+        try:
+            # Ping both models with keep_alive=60m — loads them into VRAM now
+            _ollama.chat(model="qwen3:1.7b",
+                         messages=[{"role":"user","content":"hi"}],
+                         options={"num_predict": 1, "temperature": 0},
+                         keep_alive="60m")
+            print("[startup] qwen3:1.7b loaded into GPU")
+        except Exception as e:
+            print(f"[startup] warmup failed: {e}")
+    await loop.run_in_executor(None, _load)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_encoder = EventEncoder()
+_FRONTEND = Path(__file__).parent / "frontend"
+
+
+# ── Lazy model singletons (loaded once per server process) ─────────────────
+
+_retriever_instance = None
+_clip_instance = None
+_reranker_instance = None
+
+
+def _get_retriever():
+    global _retriever_instance
+    if _retriever_instance is None:
+        from rufus.retriever import ProductRetriever
+        _retriever_instance = ProductRetriever()
+        _ = _retriever_instance.model   # warm BGE-M3
+    return _retriever_instance
+
+
+def _get_clip():
+    global _clip_instance
+    if _clip_instance is None:
+        from rufus.clip_retriever import CLIPRetriever
+        _clip_instance = CLIPRetriever()
+    return _clip_instance
+
+
+def _get_reranker():
+    global _reranker_instance
+    if _reranker_instance is None:
+        from rufus.reranker import ProductReranker
+        _reranker_instance = ProductReranker()
+        _reranker_instance.model.predict(
+            [("warmup", "warmup")], show_progress_bar=False
+        )
+    return _reranker_instance
+
+
+def _retrieve(query: str, intent: str, top_k: int = 5) -> list:
+    from rufus.fusion import rrf_fuse
+    pool = max(top_k * 8, 40)
+    text_hits = _get_retriever().retrieve(query, top_k=pool)
+    clip = _get_clip()
+    if intent in ("search", "qa", "compare") and clip.available():
+        clip_hits = clip.retrieve(query, top_k=pool)
+        candidates = rrf_fuse([text_hits, clip_hits], top_k=pool)
+    else:
+        candidates = text_hits
+    reranked = _get_reranker().rerank(query, candidates, top_k=top_k * 2)
+    return [p for p in reranked if p.image_url][:top_k]
+
+
+def _products_to_json(products: list) -> list[dict]:
+    return [
+        {
+            "product_id":  p.product_id,
+            "title":       p.title,
+            "brand":       p.brand,
+            "color":       p.color,
+            "bullet_point": p.bullet_point,
+            "score":       round(p.score, 4),
+            "image_url":   p.image_url,
+        }
+        for p in products
+    ]
+
+
+def _extract_text(messages: list) -> tuple[str, list[dict]]:
+    """Return (last_user_text, llm_history) from AG-UI message list."""
+    history: list[dict] = []
+    text = ""
+    for m in messages:
+        role = getattr(m, "role", None) or m.get("role", "user")
+        content = getattr(m, "content", None) or m.get("content", "")
+        if isinstance(content, list):
+            # multipart — grab text parts
+            text_parts = []
+            for part in content:
+                if hasattr(part, "text"):
+                    text_parts.append(part.text)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(part.get("text", ""))
+            content = " ".join(text_parts)
+        if role == "user":
+            text = str(content)
+        history.append({"role": role, "content": str(content)})
+    return text, history[:-1]   # last item is the current user turn
+
+
+def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    """Run the full Rufus pipeline synchronously, pushing AG-UI SSE strings into queue."""
+
+    def emit(event) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, _encoder.encode(event))
+
+    def done() -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    run_id  = str(uuid.uuid4())
+    msg_id  = str(uuid.uuid4())
+    thread_id = input_data.thread_id or str(uuid.uuid4())
+
+    try:
+        emit(RunStartedEvent(thread_id=thread_id, run_id=run_id))
+
+        text, history = _extract_text(input_data.messages or [])
+        if not text:
+            emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+            return
+
+        # ── Classify ───────────────────────────────────────────────────────
+        emit(StepStartedEvent(step_name="classify"))
+        from rufus.intent import classify
+        clf     = classify(text, history)
+        intent  = clf["intent"]
+        query   = clf.get("query") or text
+        filters = clf.get("filters") or {}
+        emit(CustomEvent(name="intent", value={"intent": intent, "query": query, "filters": filters}))
+        emit(StepFinishedEvent(step_name="classify"))
+
+        # ── Personalization preference update ─────────────────────────────
+        session_id = input_data.thread_id or thread_id
+        try:
+            from rufus.personalization import update_profile
+        except Exception:
+            update_profile = None
+
+        # ── Retrieve ───────────────────────────────────────────────────────
+        products = []
+        if intent in ("search", "qa", "compare", "gift_search"):
+            emit(StepStartedEvent(step_name="retrieve"))
+            products = _retrieve(query, intent)
+            if update_profile:
+                try:
+                    update_profile(session_id, products)
+                except Exception:
+                    pass
+            emit(CustomEvent(name="products", value=_products_to_json(products)))
+            emit(StepFinishedEvent(step_name="retrieve"))
+        elif intent == "followup":
+            # reuse products from state if sent by client
+            state = input_data.state or {}
+            raw = state.get("products", [])
+            if raw:
+                emit(CustomEvent(name="products", value=raw))
+
+        # ── Generate (streaming) ───────────────────────────────────────────
+        emit(StepStartedEvent(step_name="generate"))
+        emit(TextMessageStartEvent(message_id=msg_id))
+
+        from rufus.llm import OllamaClient
+        from rufus.rag import SYSTEM_PROMPT, _format_context
+        context = _format_context(products) if products else "No products found."
+        msgs = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *history[-8:],
+            {"role": "user", "content": f"Retrieved products:\n{context}\n\nCustomer question: {text}"},
+        ]
+        if intent == "chitchat":
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}, *history[-8:],
+                    {"role": "user", "content": text}]
+
+        stream = OllamaClient().chat(msgs, stream=True)
+        token_count = 0
+        if stream:
+            for token in stream:
+                emit(TextMessageContentEvent(message_id=msg_id, delta=token))
+                token_count += 1
+        if token_count == 0:
+            print("[server] LLM returned no tokens — Ollama may not be running")
+            emit(TextMessageContentEvent(
+                message_id=msg_id,
+                delta="⚠️ LLM unavailable — make sure Ollama is running (`ollama serve`).",
+            ))
+
+        emit(TextMessageEndEvent(message_id=msg_id))
+        emit(StepFinishedEvent(step_name="generate"))
+        emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+
+    except Exception as exc:
+        from ag_ui.core.events import RunErrorEvent
+        emit(RunErrorEvent(message=str(exc)))
+    finally:
+        done()
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────
+
+@app.post("/awp")
+async def agent_endpoint(body: RunAgentInput):
+    """AG-UI SSE endpoint — runs the Rufus pipeline and streams events."""
+    queue: asyncio.Queue = asyncio.Queue()
+    loop  = asyncio.get_event_loop()
+
+    thread = threading.Thread(
+        target=_run_pipeline, args=(body, queue, loop), daemon=True
+    )
+    thread.start()
+
+    async def event_stream():
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/health")
+async def health():
+    from rufus.qdrant import get_client
+    try:
+        collections = [c.name for c in get_client().get_collections().collections]
+        return {"status": "ok", "collections": collections}
+    except Exception as exc:
+        return {"status": "degraded", "error": str(exc)}
+
+
+# ── Serve frontend ─────────────────────────────────────────────────────────
+
+if _FRONTEND.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND), html=True), name="frontend")

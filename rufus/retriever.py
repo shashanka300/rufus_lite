@@ -11,6 +11,8 @@ from pathlib import Path
 import torch
 from sentence_transformers import SentenceTransformer
 
+import rufus.hardware  # apply TF32 + cuDNN benchmark globally
+
 EMBED_MODEL = "BAAI/bge-m3"
 COLLECTION = "rufus_products"
 QDRANT_PATH = Path("data/qdrant_storage")
@@ -49,7 +51,10 @@ class ProductRetriever:
     @property
     def model(self) -> SentenceTransformer:
         if self._model is None:
-            self._model = SentenceTransformer(self.model_name, device=self._device)
+            self._model = SentenceTransformer(
+                self.model_name, device=self._device,
+                model_kwargs={"torch_dtype": torch.float16}  # fp16 ~2x faster on RTX 5090
+            )
         return self._model
 
     @property
@@ -62,7 +67,11 @@ class ProductRetriever:
         cached = embedding_cache.fetch((query,))
         if cached is not None:
             return cached
-        vec = self.model.encode(query, normalize_embeddings=True).tolist()
+        vec = self.model.encode(
+            query, normalize_embeddings=True,
+            batch_size=64,       # RTX 5090 32 GB — can handle large batches
+            convert_to_numpy=True,
+        ).tolist()
         embedding_cache.put((query,), vec)
         return vec
 
