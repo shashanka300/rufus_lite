@@ -297,12 +297,7 @@ Verified timings on RTX 5090:
 - **Week 5 ✅** Production reliability — circuit breaker, retry, caching, telemetry, cross-encoder reranker
 - **Week 6 ✅** AG-UI server + streaming frontend, supply chain layer, mock features, hardware optimisation
 
-**Remaining / in progress:**
-- Demand forecast model training at scale (statsforecast AutoETS on full M5)
-- Personalization from real clickstream (RetailRocket + Instacart ingestion)
+- **Week 7 ✅** All data ingested, image lookup (1.33M), C4 FTS, review snippets, price display, image search
+- **Week 8 ✅** Full M5 forecasts (30K SKUs, AutoETS+AutoARIMA), real session personalization, image mismatch fix
 
-**Completed this session:**
-- Review summarization — `reviews.py` now uses `rufus_reviews.db` (5.5M ASINs, 33 categories); `_format_context()` includes top helpful review snippet per product
-- Image search — base64 image extracted from AG-UI messages; routed to `CLIPRetriever.retrieve_by_image()` via RRF fusion
-- Price/rating display — product cards now show `$XX.XX` and `⭐ X.X (N)` from reviews DB
-- DataCo ingestion — `scripts/ingest_dataco.py` builds inventory + demand history from 180K supply chain records
+**Roadmap complete.** All downloaded data is ingested and wired into the application.
