@@ -115,12 +115,41 @@ def _get_reranker():
     return _reranker_instance
 
 
+def _apply_filters(products: list, filters: dict) -> list:
+    """Post-retrieval filter by brand / color / price_max. Falls back to unfiltered if < 2 survive."""
+    brand     = (filters.get("brand") or "").lower().strip()
+    color     = (filters.get("color") or "").lower().strip()
+    price_max = filters.get("price_max")
+
+    # Batch price lookup only if needed
+    price_map: dict = {}
+    if price_max is not None:
+        from rufus.reviews import get_meta_batch
+        price_map = {pid: (m.get("price") or 0)
+                     for pid, m in get_meta_batch([p.product_id for p in products]).items()}
+
+    filtered = []
+    for p in products:
+        if brand and brand not in (p.brand or "").lower():
+            continue
+        if color and color not in (p.color or "").lower():
+            continue
+        if price_max is not None:
+            price = price_map.get(p.product_id)
+            if price and float(price) > float(price_max):
+                continue
+        filtered.append(p)
+
+    return filtered if len(filtered) >= 2 else products
+
+
 def _retrieve(
     query: str,
     intent: str,
     top_k: int = 5,
     image_data: str | None = None,
     session_id: str = "",
+    filters: dict | None = None,
 ) -> list:
     from rufus.fusion import rrf_fuse
     pool = max(top_k * 8, 40)
@@ -150,6 +179,8 @@ def _retrieve(
 
     candidates = rrf_fuse(ranker_lists, top_k=pool) if len(ranker_lists) > 1 else text_hits
     reranked = _get_reranker().rerank(query, candidates, top_k=top_k * 2)
+    if filters and any(filters.values()):
+        reranked = _apply_filters(reranked, filters)
     return reranked[:top_k]
 
 
@@ -325,11 +356,35 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
             emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
             return
 
+        # ── Cart intents ───────────────────────────────────────────────────
+        if intent in ("add_to_cart", "view_cart"):
+            from rufus.cart import add_item, format_cart, remove_item
+            state = input_data.state or {}
+            cart: list[dict] = list(state.get("cart") or [])
+            emit(StepStartedEvent(step_name="generate"))
+            emit(TextMessageStartEvent(message_id=msg_id))
+            if intent == "add_to_cart":
+                prev_products = state.get("products") or []
+                if prev_products:
+                    item = prev_products[0]
+                    cart = add_item(cart, item)
+                    answer = f"Added **{item.get('title','product')[:50]}** to your cart.\n\n{format_cart(cart)}"
+                else:
+                    answer = "No product to add — please search for something first."
+            else:
+                answer = format_cart(cart)
+            emit(CustomEvent(name="cart", value=cart))
+            emit(TextMessageContentEvent(message_id=msg_id, delta=answer))
+            emit(TextMessageEndEvent(message_id=msg_id))
+            emit(StepFinishedEvent(step_name="generate"))
+            emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+            return
+
         # ── Retrieve ───────────────────────────────────────────────────────
         products = []
         if intent in ("search", "qa", "compare", "gift_search") or image_data:
             emit(StepStartedEvent(step_name="retrieve"))
-            products = _retrieve(query, intent, image_data=image_data, session_id=session_id)
+            products = _retrieve(query, intent, image_data=image_data, session_id=session_id, filters=filters)
             if update_profile:
                 try:
                     update_profile(session_id, products)

@@ -92,6 +92,7 @@ class ProductRetriever:
                 description=h.payload.get("product_description"),
                 locale=h.payload.get("product_locale", "us"),
                 score=h.score,
+                image_url=h.payload.get("image_url"),
             )
             for h in hits.points
         ]

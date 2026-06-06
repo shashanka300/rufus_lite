@@ -16,6 +16,7 @@ chitchat  – greeting, thanks, or off-topic
 from __future__ import annotations
 
 import json
+import re
 
 import ollama
 
@@ -89,6 +90,32 @@ Rules:
 
 _EMPTY_FILTERS = {"brand": None, "color": None, "price_max": None, "category": None}
 
+_COLORS = frozenset({
+    "black", "white", "red", "blue", "green", "yellow", "gray", "grey",
+    "silver", "gold", "pink", "purple", "orange", "brown", "beige", "navy",
+    "rose", "mint", "teal", "coral", "maroon", "cream", "tan", "charcoal",
+})
+_PRICE_RE  = re.compile(r"(?:under|less than|below|max|up to|at most)\s+\$?\s*(\d+(?:\.\d+)?)", re.I)
+_PRICE_RE2 = re.compile(r"\$\s*(\d+(?:\.\d+)?)\s*(?:or less|max|maximum)", re.I)
+
+
+def _extract_filters(message: str) -> dict:
+    """Regex-based filter extraction for price and color — fast, no LLM."""
+    m = message.lower()
+    words = set(re.findall(r"\b\w+\b", m))
+
+    price_max = None
+    pm = _PRICE_RE.search(m) or _PRICE_RE2.search(m)
+    if pm:
+        try:
+            price_max = float(pm.group(1))
+        except ValueError:
+            pass
+
+    color = next((c for c in _COLORS if c in words), None)
+
+    return {"brand": None, "color": color, "price_max": price_max, "category": None}
+
 _GIFT_WORDS    = ("gift for", "present for", "buying for my", "for my mom", "for my dad",
                    "for my wife", "for my husband", "for my friend", "gift idea",
                    "something for", "buying for someone", "for a friend")
@@ -159,9 +186,9 @@ def _fast_classify(message: str, has_history: bool) -> dict | None:
     if any(w in m for w in _COMPARE_WORDS):
         return {"intent": "compare", "query": message, "filters": _EMPTY_FILTERS}
 
-    # First turn with no history → almost certainly a search
+    # First turn with no history → almost certainly a search; extract filters inline
     if not has_history:
-        return {"intent": "search", "query": message, "filters": _EMPTY_FILTERS}
+        return {"intent": "search", "query": message, "filters": _extract_filters(message)}
 
     return None   # ambiguous — fall through to LLM
 

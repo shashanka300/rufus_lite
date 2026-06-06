@@ -136,24 +136,31 @@
 // ── State ────────────────────────────────────────────────────────────────
 
 const BADGE = {
-  search:   '#1f77b4', followup: '#ff7f0e', qa: '#2ca02c',
-  compare:  '#9467bd', chitchat: '#7f7f7f', image: '#d62728',
+  search:          '#1f77b4', followup:        '#ff7f0e', qa:              '#2ca02c',
+  compare:         '#9467bd', chitchat:        '#7f7f7f', image:           '#d62728',
+  gift_search:     '#e377c2', add_to_cart:     '#17becf', view_cart:       '#17becf',
+  check_stock:     '#8c564b', reorder_alert:   '#bcbd22', demand_forecast: '#bcbd22',
+  supplier_query:  '#8c564b', sc_analytics:    '#8c564b',
 };
 
-let threadId  = crypto.randomUUID();
-let history   = [];   // [{role, content}]
-let running   = false;
-let imgData   = null; // base64 string
-let imgFile   = null;
-let stepStart = {};   // stepName → Date.now()
-let timings   = {};
+let threadId     = crypto.randomUUID();
+let history      = [];   // [{role, content}]
+let running      = false;
+let imgData      = null; // base64 string
+let imgFile      = null;
+let stepStart    = {};   // stepName → Date.now()
+let timings      = {};
+let lastProducts = [];   // last products shown (for followup / add_to_cart)
+let cartItems    = [];   // client-side cart mirror
 
 // ── Session ───────────────────────────────────────────────────────────────
 
 function newSession() {
-  threadId = crypto.randomUUID();
-  history  = [];
-  imgData  = null;
+  threadId     = crypto.randomUUID();
+  history      = [];
+  imgData      = null;
+  lastProducts = [];
+  cartItems    = [];
   document.getElementById('messages').innerHTML =
     '<div class="text-center py-16 text-slate-400"><div class="text-5xl mb-4">🛍️</div><p class="text-lg font-medium text-slate-600">New session started</p></div>';
   resetPanel();
@@ -354,7 +361,7 @@ async function sendMessage() {
         threadId,
         runId,
         messages: history,
-        state: {},
+        state: { products: lastProducts, cart: cartItems },
         tools: [],
         context: [],
         forwardedProps: {},
@@ -439,7 +446,11 @@ async function sendMessage() {
               }
             }
             if (evt.name === 'products') {
+              lastProducts = evt.value;
               renderProducts(productsEl, evt.value);
+            }
+            if (evt.name === 'cart') {
+              cartItems = evt.value || [];
             }
             break;
 
