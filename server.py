@@ -262,6 +262,69 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
         except Exception:
             update_profile = None
 
+        # ── Supply chain intents ──────────────────────────────────────────
+        _SC_INTENTS = {"check_stock", "reorder_alert", "demand_forecast",
+                       "supplier_query", "sc_analytics"}
+        if intent in _SC_INTENTS:
+            emit(StepStartedEvent(step_name="retrieve"))
+            sc_context = "No supply chain data available."
+            try:
+                from rufus.demand import (bulk_reorder_check, category_demand_summary,
+                                          forecast_sku, inventory_health_report)
+                from rufus.inventory import get_all_suppliers, get_low_stock, search_inventory
+                from rufus.sc_rag import SC_SYSTEM_PROMPT, format_sc_context
+
+                inventory_hits: list = []
+                alerts: list = []
+                forecast = None
+                suppliers: list = []
+
+                if intent == "check_stock":
+                    inventory_hits = search_inventory(query, limit=8)
+                elif intent == "reorder_alert":
+                    alerts = bulk_reorder_check()
+                elif intent == "demand_forecast":
+                    hits = search_inventory(query, limit=1)
+                    if hits:
+                        forecast = forecast_sku(hits[0]["sku"])
+                    else:
+                        summary = category_demand_summary(query)
+                        inventory_hits = summary.get("top_items", [])
+                elif intent == "supplier_query":
+                    suppliers = get_all_suppliers(limit=10)
+                elif intent == "sc_analytics":
+                    report = inventory_health_report()
+                    inventory_hits = report.get("top_critical", [])
+
+                sc_context = format_sc_context(
+                    intent,
+                    inventory=inventory_hits or None,
+                    alerts=alerts or None,
+                    forecast=forecast,
+                    suppliers=suppliers or None,
+                )
+            except Exception as sc_err:
+                sc_context = f"Supply chain data error: {sc_err}"
+
+            emit(StepFinishedEvent(step_name="retrieve"))
+            emit(StepStartedEvent(step_name="generate"))
+            emit(TextMessageStartEvent(message_id=msg_id))
+
+            from rufus.llm import OllamaClient
+            from rufus.sc_rag import SC_SYSTEM_PROMPT
+            sc_msgs = [
+                {"role": "system", "content": SC_SYSTEM_PROMPT},
+                *history[-6:],
+                {"role": "user", "content": f"Supply chain data:\n{sc_context}\n\nQuestion: {text}"},
+            ]
+            stream = OllamaClient().chat(sc_msgs, stream=True)
+            for token in (stream or []):
+                emit(TextMessageContentEvent(message_id=msg_id, delta=token))
+            emit(TextMessageEndEvent(message_id=msg_id))
+            emit(StepFinishedEvent(step_name="generate"))
+            emit(RunFinishedEvent(thread_id=thread_id, run_id=run_id))
+            return
+
         # ── Retrieve ───────────────────────────────────────────────────────
         products = []
         if intent in ("search", "qa", "compare", "gift_search") or image_data:

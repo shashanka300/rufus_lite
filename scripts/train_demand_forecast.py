@@ -48,7 +48,8 @@ app = typer.Typer(help="Train demand forecasts on GPU (NeuralForecast NHITS).")
 def _gpu_forecast(df_long: pd.DataFrame, horizon: int) -> pd.DataFrame | None:
     """
     Run NHITS on GPU across all series at once.
-    Returns a long-format DataFrame with columns [unique_id, ds, NHITS].
+    Automatically picks the largest input_size that fits the shortest series.
+    Returns a long-format DataFrame or None on failure.
     """
     try:
         import torch
@@ -56,23 +57,27 @@ def _gpu_forecast(df_long: pd.DataFrame, horizon: int) -> pd.DataFrame | None:
         from neuralforecast.models import NHITS
 
         device = "gpu" if torch.cuda.is_available() else "cpu"
+
+        # Adapt input_size to the shortest series (need 2x for train+val split)
+        min_len = df_long.groupby("unique_id")["ds"].count().min()
+        input_size = max(horizon, min(horizon * 4, int(min_len * 0.6)))
         console.print(f"  [cyan]NeuralForecast NHITS on {device.upper()}[/cyan]  "
-                      f"({len(df_long['unique_id'].unique()):,} series)")
+                      f"({len(df_long['unique_id'].unique()):,} series, "
+                      f"min_len={min_len}, input_size={input_size})")
 
         model = NHITS(
             h=horizon,
-            input_size=horizon * 4,   # look-back window = 4x horizon
+            input_size=input_size,
             max_steps=500,
             accelerator=device,
             devices=1,
             enable_progress_bar=True,
             logger=False,
+            start_padding_enabled=True,   # pad short series instead of raising
         )
         nf = NeuralForecast(models=[model], freq="D")
         nf.fit(df_long)
         pred = nf.predict().reset_index()
-        pred.columns = [c.replace("NHITS", "forecast") if c == "NHITS" else c
-                        for c in pred.columns]
         return pred
 
     except Exception as e:
@@ -237,7 +242,9 @@ def train_from_history(n_skus: int = 0) -> None:
         console.print("  [green]All history SKUs already forecasted.[/green]")
         return
 
-    pred   = _gpu_forecast(valid, HORIZON) or _rolling_fallback(valid, HORIZON)
+    pred = _gpu_forecast(valid, HORIZON)
+    if pred is None:
+        pred = _rolling_fallback(valid, HORIZON)
     stored = _store(pred)
     console.print(f"  [green]history forecast rows stored: {stored:,}[/green]")
 
