@@ -53,19 +53,48 @@ app = FastAPI(title="Rufus AG-UI Server")
 
 @app.on_event("startup")
 async def _warmup():
-    """Pre-load models into GPU on startup so the first request has no cold-start delay."""
+    """Pre-load all models into GPU/RAM on startup so the first request has no cold-start delay."""
     import asyncio, ollama as _ollama
     loop = asyncio.get_event_loop()
     def _load():
         try:
-            # Ping both models with keep_alive=60m — loads them into VRAM now
+            # 1. Ping classifier model (fast, stays resident for intent routing)
             _ollama.chat(model="qwen3:1.7b",
                          messages=[{"role":"user","content":"hi"}],
                          options={"num_predict": 1, "temperature": 0},
                          keep_alive="60m")
-            print("[startup] qwen3:1.7b loaded into GPU")
+            print("[startup] qwen3:1.7b loaded into GPU (classifier)")
         except Exception as e:
-            print(f"[startup] warmup failed: {e}")
+            print(f"[startup] qwen3:1.7b warmup failed: {e}")
+        try:
+            # 2. Ping generation model (larger, better instruction-following)
+            _ollama.chat(model="qwen3.5:latest",
+                         messages=[{"role":"user","content":"hi"}],
+                         options={"num_predict": 1, "temperature": 0},
+                         keep_alive="60m",
+                         think=False)
+            print("[startup] qwen3.5:latest loaded into GPU (generator)")
+        except Exception as e:
+            print(f"[startup] qwen3.5:latest warmup failed: {e}")
+        try:
+            # 3. Ensure Qdrant is connected (prefer server mode over local-file mode)
+            from rufus.qdrant import get_client
+            cols = [c.name for c in get_client().get_collections().collections]
+            print(f"[startup] Qdrant connected — collections: {cols}")
+        except Exception as e:
+            print(f"[startup] Qdrant probe failed: {e}")
+        try:
+            # 4. Warm BGE-M3 embedding model — avoids ~18s cold-start on first search
+            _get_retriever()
+            print("[startup] BGE-M3 embedding model loaded into GPU")
+        except Exception as e:
+            print(f"[startup] BGE-M3 warmup failed: {e}")
+        try:
+            # 5. Warm CLIP retriever
+            _get_clip()
+            print("[startup] CLIP model loaded")
+        except Exception as e:
+            print(f"[startup] CLIP warmup failed: {e}")
     await loop.run_in_executor(None, _load)
 
 
@@ -382,7 +411,10 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
 
         # ── Retrieve ───────────────────────────────────────────────────────
         products = []
-        if intent in ("search", "qa", "compare", "gift_search") or image_data:
+        raw_followup_products: list[dict] = []
+
+        if intent in ("search", "gift_search") or image_data:
+            # Always do a fresh retrieval for new search queries
             emit(StepStartedEvent(step_name="retrieve"))
             products = _retrieve(query, intent, image_data=image_data, session_id=session_id, filters=filters)
             if update_profile:
@@ -392,20 +424,39 @@ def _run_pipeline(input_data: RunAgentInput, queue: asyncio.Queue, loop: asyncio
                     pass
             emit(CustomEvent(name="products", value=_products_to_json(products)))
             emit(StepFinishedEvent(step_name="retrieve"))
-        elif intent == "followup":
-            # reuse products from state if sent by client
+
+        elif intent in ("qa", "followup", "compare"):
+            # Prefer products already on screen — compare/qa/followup all refer to shown products.
+            # Fall back to fresh retrieval only when there is no prior context.
             state = input_data.state or {}
-            raw = state.get("products", [])
+            raw = state.get("products") or []
             if raw:
+                raw_followup_products = raw
                 emit(CustomEvent(name="products", value=raw))
+            else:
+                # No prior products → treat like a search
+                emit(StepStartedEvent(step_name="retrieve"))
+                products = _retrieve(query, intent, session_id=session_id, filters=filters)
+                if update_profile:
+                    try:
+                        update_profile(session_id, products)
+                    except Exception:
+                        pass
+                emit(CustomEvent(name="products", value=_products_to_json(products)))
+                emit(StepFinishedEvent(step_name="retrieve"))
 
         # ── Generate (streaming) ───────────────────────────────────────────
         emit(StepStartedEvent(step_name="generate"))
         emit(TextMessageStartEvent(message_id=msg_id))
 
         from rufus.llm import OllamaClient
-        from rufus.rag import SYSTEM_PROMPT, _format_context
-        context = _format_context(products) if products else "No products found."
+        from rufus.rag import SYSTEM_PROMPT, _format_context, _format_raw_context
+        if products:
+            context = _format_context(products)
+        elif raw_followup_products:
+            context = _format_raw_context(raw_followup_products)
+        else:
+            context = "No products found."
         msgs = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *history[-8:],

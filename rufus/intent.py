@@ -83,12 +83,49 @@ Rules:
   sc_analytics (inventory dashboard/summary)
 - query = clean keyword string for product/SKU lookup; null for reorder_alert and sc_analytics
 - price_max must be a number or null; brand/color/category must be string or null
+- Fix typos and expand short/unusual queries: "saries" → "sarees Indian traditional ethnic dress";
+  "kurta" → "kurta Indian men traditional clothing"; "duvet" → "duvet comforter bedding"
+- Remove ranking/sorting modifiers from query: "best selling", "top rated", "trending", etc.
+- Keep product-specific terms unchanged: "noise cancelling", "IPX7", "OLED", "4K" etc.
 
 {_FEW_SHOT}\
 """
 
 
 _EMPTY_FILTERS = {"brand": None, "color": None, "price_max": None, "category": None}
+
+# Ranking/quality modifiers that pollute semantic search embeddings.
+# "best selling sarees" → embedding drifts toward books/music; strip to "sarees"
+# Applied to the retrieval query ONLY — filters use the original message.
+_MODIFIER_RE = re.compile(
+    r"\b(?:"
+    r"best[\s\-]?selling|best[\s\-]?seller|bestselling|top[\s\-]?selling|"
+    r"top[\s\-]?rated|most[\s\-]?popular|most[\s\-]?loved|most[\s\-]?reviewed|"
+    r"highly[\s\-]?rated|highly[\s\-]?reviewed|well[\s\-]?reviewed|"
+    r"trending|hot[\s\-]?selling|fast[\s\-]?selling|"
+    r"new[\s\-]?arrivals?|latest[\s\-]?arrivals?|"
+    r"award[\s\-]?winning|editor[s']?[\s\-]?choice|"
+    r"good|great|nice|excellent|amazing|awesome|fantastic|incredible|"
+    r"affordable|budget[\s\-]?friendly|inexpensive|economical|cheap"
+    r")\b\s*",
+    re.I,
+)
+
+
+def _clean_query(message: str) -> str:
+    """Strip ranking/quality modifier words that pull embeddings off-target.
+
+    Examples:
+      'best selling sarees'            -> 'sarees'
+      'top rated gaming headset'       -> 'gaming headset'
+      'trending affordable sneakers'   -> 'sneakers'
+      'noise cancelling headphones'    -> 'noise cancelling headphones' (unchanged)
+    """
+    cleaned = _MODIFIER_RE.sub(" ", message).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    # Fall back to original if we wiped everything (e.g. bare "best")
+    return cleaned if len(cleaned) >= 3 else message
+
 
 _COLORS = frozenset({
     "black", "white", "red", "blue", "green", "yellow", "gray", "grey",
@@ -124,16 +161,27 @@ _CART_ADD      = ("add to cart", "add this", "add that", "add the first", "add t
 _CART_VIEW     = ("what's in my cart", "show cart", "view cart", "my cart", "cart total")
 _CART_REMOVE   = ("remove from cart", "delete from cart", "take out", "remove the")
 
-_SC_REORDER    = ("reorder", "what needs to be ordered", "low stock", "out of stock",
-                   "what to reorder", "items to reorder", "purchase order")
-_SC_FORECAST   = ("how much will we sell", "demand forecast", "predict sales",
-                   "forecast", "next month sales", "expected demand")
-_SC_STOCK      = ("in stock", "stock level", "how many", "do we have", "inventory",
-                   "is there any", "available units", "qty on hand")
-_SC_SUPPLIER   = ("supplier", "vendor", "lead time", "who supplies", "procurement",
-                   "purchase from", "source from")
-_SC_ANALYTICS  = ("inventory health", "overstock", "inventory report", "stock summary",
-                   "dashboard", "supply chain analytics")
+_SC_REORDER    = ("reorder alert", "what needs to be reordered", "items to reorder",
+                   "purchase order", "create a po", "replenish stock", "what to reorder",
+                   "low stock", "low inventory", "stock shortage")
+_SC_FORECAST   = ("demand forecast", "predict sales", "sales forecast",
+                   "next month sales", "expected demand", "how much will we sell")
+_SC_STOCK      = ("stock level", "qty on hand", "units on hand",
+                   "check inventory", "inventory level", "inventory status",
+                   "show inventory", "view inventory", "inventory check",
+                   "warehouse stock", "current stock",
+                   "how many units do we have", "how many units in stock",
+                   "check stock", "stock check",
+                   "what is in stock", "what's in stock",
+                   "what is out of stock", "what's out of stock",
+                   "out of stock report", "in stock report")
+_SC_SUPPLIER   = ("our supplier", "our vendor", "vendor lead time", "who supplies us",
+                   "supplier information", "supplier details", "supplier list",
+                   "procurement team", "source from supplier", "supplier lead time")
+_SC_ANALYTICS  = ("inventory health", "overstock", "inventory report",
+                   "stock summary", "supply chain", "supply chain analytics",
+                   "inventory dashboard", "sc dashboard", "show me the inventory",
+                   "all inventory", "full inventory")
 
 _FOLLOWUP_STARTS = ("does it", "do any", "do they", "which one", "can you",
                     "what about", "is there", "are there", "how about",
@@ -184,11 +232,19 @@ def _fast_classify(message: str, has_history: bool) -> dict | None:
         return {"intent": "followup", "query": None, "filters": _EMPTY_FILTERS}
 
     if any(w in m for w in _COMPARE_WORDS):
-        return {"intent": "compare", "query": message, "filters": _EMPTY_FILTERS}
+        return {"intent": "compare", "query": _clean_query(message), "filters": _EMPTY_FILTERS}
 
-    # First turn with no history → almost certainly a search; extract filters inline
+    # First turn with no history → almost certainly a search.
+    # Use fast-path only when the cleaned query has ≥ 3 meaningful words.
+    # Short or heavily-modified queries (e.g. "saries", "best selling saries")
+    # fall through to the LLM, which rewrites them into proper search terms.
     if not has_history:
-        return {"intent": "search", "query": message, "filters": _extract_filters(message)}
+        cleaned = _clean_query(message)
+        word_count = len(cleaned.split())
+        if word_count >= 3:
+            return {"intent": "search", "query": cleaned, "filters": _extract_filters(message)}
+        # 1-2 word query: let LLM rewrite for better retrieval accuracy
+        return None
 
     return None   # ambiguous — fall through to LLM
 
@@ -210,10 +266,10 @@ def classify(message: str, history: list[dict]) -> dict:
 
     try:
         resp = ollama.chat(
-            model="qwen3:1.7b",
+            model="qwen3.5:latest",
             messages=msgs,
             format="json",
-            options={"temperature": 0, "num_predict": 256},
+            options={"temperature": 0, "num_predict": 128, "num_ctx": 2048},
             keep_alive="60m",
             think=False,
         )
@@ -231,6 +287,9 @@ def classify(message: str, history: list[dict]) -> dict:
         result["intent"] = "search"
     if not result.get("query"):
         result["query"] = message if result["intent"] == "search" else None
+    # Clean modifier words from retrieval query (LLM usually handles this but be safe)
+    if result.get("query"):
+        result["query"] = _clean_query(result["query"])
     filters = result.get("filters") or {}
     result["filters"] = {
         "brand": filters.get("brand") or None,

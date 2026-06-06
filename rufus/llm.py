@@ -28,8 +28,8 @@ from collections.abc import Iterator
 
 import ollama
 
-DEFAULT_MODEL   = "qwen3:1.7b"   # qwen3.5:latest routes output to thinking field, not content
-TIMEOUT_SECS    = 45       # max time to wait for a single chat call
+DEFAULT_MODEL   = "qwen3.5:latest"  # 6.6 GB; better instruction-following than 1.7b
+TIMEOUT_SECS    = 60       # max time to wait for a single chat call
 MAX_RETRIES     = 2        # attempts after first failure (total = 3)
 BASE_BACKOFF    = 0.5      # seconds, doubled each retry
 FAILURE_THRESH  = 3        # consecutive failures before breaker opens
@@ -86,7 +86,7 @@ def _chat_with_retry(model: str, messages: list[dict], stream: bool) -> any:
     # Do NOT set think:False for qwen3 — it routes output to `thinking` field
     # and leaves `content` empty. Without it, thinking goes to `thinking` field
     # and the final answer goes to `content` (correct behaviour).
-    opts: dict = {"timeout": TIMEOUT_SECS, "num_ctx": 2048, "num_predict": 512, "temperature": 0}
+    opts: dict = {"timeout": TIMEOUT_SECS, "num_ctx": 2048, "num_predict": 256, "temperature": 0}
     # think=False as a direct kwarg (NOT inside options) suppresses CoT for qwen3.
     # Passing it inside options routes output to the thinking field instead.
     kwargs = {"options": opts, "keep_alive": "60m", "think": False}

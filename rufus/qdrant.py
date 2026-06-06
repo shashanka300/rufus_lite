@@ -21,16 +21,18 @@ from pathlib import Path
 from qdrant_client import QdrantClient
 
 _client: QdrantClient | None = None
+_client_mode: str = "none"   # "server" | "local" | "none"
 
 
 def _close_client() -> None:
-    global _client
+    global _client, _client_mode
     if _client is not None:
         try:
             _client.close()
         except Exception:
             pass
         _client = None
+    _client_mode = "none"
 
 
 atexit.register(_close_client)
@@ -53,14 +55,28 @@ def _try_server() -> QdrantClient | None:
 
 
 def get_client() -> QdrantClient:
-    global _client
+    global _client, _client_mode
     if _client is not None:
+        # If we started in local-file mode, opportunistically try to upgrade to
+        # server mode on each call — handles the case where qdrant.exe starts
+        # after the app process (e.g. first-launch ordering issue).
+        if _client_mode == "local":
+            server = _try_server()
+            if server is not None:
+                print("[qdrant] Server came online — switching from local-file to server mode")
+                try:
+                    _client.close()
+                except Exception:
+                    pass
+                _client = server
+                _client_mode = "server"
         return _client
 
     server = _try_server()
     if server is not None:
         print(f"[qdrant] Connected to server at {_SERVER_HOST}:{_SERVER_PORT}")
         _client = server
+        _client_mode = "server"
     else:
         print(
             "[qdrant] Server not found — using local file mode. "
@@ -69,5 +85,6 @@ def get_client() -> QdrantClient:
         )
         _LOCAL_PATH.mkdir(parents=True, exist_ok=True)
         _client = QdrantClient(path=str(_LOCAL_PATH))
+        _client_mode = "local"
 
     return _client
