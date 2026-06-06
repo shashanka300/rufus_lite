@@ -253,9 +253,9 @@ def train_from_history(n_skus: int = 0) -> None:
 
 @app.command()
 def main(
-    m5_only: bool = typer.Option(False, "--m5-only"),
-    n_skus:  int  = typer.Option(0,     "--n-skus", help="Limit SKUs per source (0=all)"),
-    retrain: bool = typer.Option(False, "--retrain", help="Clear existing forecasts and retrain from scratch on GPU"),
+    with_m5: bool = typer.Option(False, "--with-m5",  help="Also forecast M5 Walmart series (opt-in; SKUs don't map to inventory)"),
+    n_skus:  int  = typer.Option(0,     "--n-skus",   help="Limit SKUs per source (0=all)"),
+    retrain: bool = typer.Option(False, "--retrain",  help="Clear existing forecasts and retrain from scratch on GPU"),
 ) -> None:
     init_db()
 
@@ -265,10 +265,10 @@ def main(
             conn.execute("DELETE FROM forecasts")
         console.print(f"[yellow]--retrain: cleared {n:,} existing forecasts[/yellow]")
 
-    if not m5_only:
-        train_from_history(n_skus)
+    train_from_history(n_skus)
 
-    train_m5(n_skus)
+    if with_m5:
+        train_m5(n_skus)
 
     with get_db() as conn:
         n    = conn.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
