@@ -96,19 +96,28 @@ def _rolling_fallback(df_long: pd.DataFrame, horizon: int) -> pd.DataFrame:
 
 
 def _store(pred: pd.DataFrame) -> int:
-    """Write forecast DataFrame to rufus_sc.db forecasts table."""
+    """Write forecast DataFrame to rufus_sc.db forecasts table.
+
+    NeuralForecast ds values are anchored to the training data end date.
+    We remap them to today + offset (1..H) so get_forecast() date filter works.
+    """
     today = datetime.utcnow()
-    rows = []
-    for r in pred.itertuples():
-        pred_val = max(float(getattr(r, "forecast", 0)), 0.0)
-        ci = pred_val * 0.15
-        rows.append((
-            str(r.unique_id),
-            pd.Timestamp(r.ds).strftime("%Y-%m-%d"),
-            round(pred_val, 2),
-            round(max(pred_val - ci, 0.0), 2),
-            round(pred_val + ci, 2),
-        ))
+    rows  = []
+
+    for sku, grp in pred.groupby("unique_id"):
+        grp_sorted = grp.sort_values("ds").reset_index(drop=True)
+        for i, row in grp_sorted.iterrows():
+            pred_val = max(float(row.get("forecast", row.get("NHITS", 0))), 0.0)
+            ci       = pred_val * 0.15
+            fdate    = (today + timedelta(days=int(i) + 1)).strftime("%Y-%m-%d")
+            rows.append((
+                str(sku),
+                fdate,
+                round(pred_val, 2),
+                round(max(pred_val - ci, 0.0), 2),
+                round(pred_val + ci, 2),
+            ))
+
     with get_db() as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO forecasts "
