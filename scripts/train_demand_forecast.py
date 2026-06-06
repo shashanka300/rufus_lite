@@ -158,18 +158,26 @@ def train_m5(n_skus: int = 0) -> None:
     df_melt["ds"] = pd.to_datetime(df_melt["ds"])
     df_melt["y"]  = df_melt["y"].astype(float)
 
-    # Update demand_history
-    console.print("  Updating demand_history (M5) ...")
-    hist_rows = [
-        (r.unique_id, r.ds.strftime("%Y-%m-%d"), int(r.y), "m5_walmart")
-        for r in df_melt.itertuples()
-    ]
+    # Update demand_history — skip if already populated
     with get_db() as conn:
-        conn.executemany(
-            "INSERT OR REPLACE INTO demand_history (sku, date, units_sold, store_id) VALUES (?,?,?,?)",
-            hist_rows,
-        )
-    console.print(f"  demand_history (M5): {len(hist_rows):,} rows")
+        existing_m5 = conn.execute(
+            "SELECT COUNT(*) FROM demand_history WHERE store_id='m5_walmart'"
+        ).fetchone()[0]
+
+    if existing_m5 < 1_000_000:
+        console.print("  Updating demand_history (M5) ...")
+        hist_rows = [
+            (r.unique_id, r.ds.strftime("%Y-%m-%d"), int(r.y), "m5_walmart")
+            for r in df_melt.itertuples()
+        ]
+        with get_db() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO demand_history (sku,date,units_sold,store_id) VALUES(?,?,?,?)",
+                hist_rows,
+            )
+        console.print(f"  demand_history (M5): {len(hist_rows):,} rows inserted")
+    else:
+        console.print(f"  demand_history (M5): {existing_m5:,} rows already present — skipping")
 
     # Filter to series not yet forecasted and long enough
     valid  = (
@@ -182,7 +190,9 @@ def train_m5(n_skus: int = 0) -> None:
         console.print("  [green]All M5 SKUs already forecasted.[/green]")
         return
 
-    pred = _gpu_forecast(valid, HORIZON) or _rolling_fallback(valid, HORIZON)
+    pred = _gpu_forecast(valid, HORIZON)
+    if pred is None:
+        pred = _rolling_fallback(valid, HORIZON)
     stored = _store(pred)
     console.print(f"  [green]M5 forecast rows stored: {stored:,}[/green]")
 
@@ -229,8 +239,15 @@ def train_from_history(n_skus: int = 0) -> None:
 def main(
     m5_only: bool = typer.Option(False, "--m5-only"),
     n_skus:  int  = typer.Option(0,     "--n-skus", help="Limit SKUs per source (0=all)"),
+    retrain: bool = typer.Option(False, "--retrain", help="Clear existing forecasts and retrain from scratch on GPU"),
 ) -> None:
     init_db()
+
+    if retrain:
+        with get_db() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
+            conn.execute("DELETE FROM forecasts")
+        console.print(f"[yellow]--retrain: cleared {n:,} existing forecasts[/yellow]")
 
     if not m5_only:
         train_from_history(n_skus)
